@@ -6,7 +6,9 @@ dist/
 .pytest_cache/
 .ipynb_checkpoints/
 
-# measurement data written by the notebooks (lives with the experiment, not the library)
+# measurement data (lives with the experiment, not the library)
+data/**
+experiments.db
 data_dmz/
 data_sim/
 notebooks/data_*/
