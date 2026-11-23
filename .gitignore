@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# measurement data written by the notebooks (lives with the experiment, not the library)
+data_dmz/
+data_sim/
+notebooks/data_*/

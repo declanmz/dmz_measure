@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dmz_measure"
+version = "0.1.0"
+description = "SR860 streaming and noise tools for low-frequency transport measurements"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy>=1.21", "scipy>=1.7", "matplotlib>=3.5"]
+
+[project.optional-dependencies]
+visa = ["pyvisa"]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["dmz_measure*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
