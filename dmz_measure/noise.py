@@ -119,9 +119,12 @@ class NoiseSpectrum:
 
 
 def choose_nperseg(fs: float, n: int, resolution: float, min_segments: int = 4) -> int:
-    """Power-of-two segment length for ~`resolution` Hz bins, keeping >= min_segments."""
+    """Power-of-two segment length for ~`resolution` Hz bins, keeping >= min_segments.
+
+    With 50 % overlap, k segments need n >= nperseg (k + 1) / 2.
+    """
     want = 2 ** int(np.round(np.log2(fs / resolution)))
-    longest = 2 ** int(np.floor(np.log2(max(n // ((min_segments + 1) // 2 + 1), 16))))
+    longest = 2 ** int(np.floor(np.log2(max(2 * n / (min_segments + 1), 16))))
     nper = min(want, longest)
     if nper < want:
         warnings.warn(f"record too short for {resolution:g} Hz resolution; using "
@@ -130,10 +133,11 @@ def choose_nperseg(fs: float, n: int, resolution: float, min_segments: int = 4) 
 
 
 def input_spectrum(z: np.ndarray, fs: float, f_ref: float, gain: float = 1.0,
-                   unit: str = "V", resolution: float = 0.05, fmax: Optional[float] = None,
-                   tau: Optional[float] = None, slope_db: int = 24,
-                   orientation: str = "auto", mains: float = 60.0,
-                   name: str = "") -> NoiseSpectrum:
+                   unit: str = "V", resolution: float = 0.05, fmin: float = 0.0,
+                   fmax: Optional[float] = None, tau: Optional[float] = None,
+                   slope_db: int = 24, orientation: str = "auto",
+                   mains: Optional[float] = None, name: str = "",
+                   min_segments: int = 4) -> NoiseSpectrum:
     """Input noise spectrum from a lock-in X+iY record taken at reference f_ref.
 
     z          : complex X + iY samples (NaN where packets were dropped)
@@ -142,17 +146,21 @@ def input_spectrum(z: np.ndarray, fs: float, f_ref: float, gain: float = 1.0,
     gain       : preamp gain to divide out (e.g. 100 for a x100 voltage preamp,
                  1e6 for a 1e6 V/A current preamp -> unit='A')
     resolution : target frequency bin spacing (Hz)
-    fmax       : highest input frequency kept (default 2 f_ref)
+    fmin, fmax : input frequency range kept (default 0 - 2 f_ref; anything above 0 up
+                 to f_ref + fs/2 is unambiguous)
     tau        : lock-in time constant used for the record; if given, the RC
                  filter roll-off is divided out (small for tau <= 100 us)
     orientation: 'auto' checks mains harmonics to decide whether an input at
                  f_ref + nu appears at +nu ('normal') or -nu ('flipped');
                  or force 'normal' / 'flipped'
+    mains      : 50 or 60 Hz; None = detected from the spectrum
     """
     z = np.asarray(z, dtype=complex) / gain
-    nper = choose_nperseg(fs, len(z), resolution)
+    nper = choose_nperseg(fs, len(z), resolution, min_segments)
     nu, psd, nseg = welch(z, fs, nper)
     df = fs / nper
+    if mains is None:
+        mains = detect_mains(nu, psd, f_ref, df)
 
     orient_info: Dict[str, Any] = {"requested": orientation}
     if orientation == "auto":
@@ -180,10 +188,39 @@ def input_spectrum(z: np.ndarray, fs: float, f_ref: float, gain: float = 1.0,
     if fmax is None:
         fmax = 2 * f_ref
     fmax = min(fmax, f_ref + 0.45 * fs)
-    m = (f > 0) & (f <= fmax)
+    m = (f > max(fmin, 0.0)) & (f <= fmax)
     meta = {"fs": fs, "nperseg": nper, "gain": gain, "tau": tau, "slope_db": slope_db,
             "orientation": orient_info, "mains": mains}
     return NoiseSpectrum(f[m], psd[m], unit, f_ref, df, nseg, name, meta)
+
+
+def block_spectra(z: np.ndarray, fs: float, like: NoiseSpectrum, block: float) -> List[NoiseSpectrum]:
+    """Spectra of consecutive `block`-second pieces of a record, analysed like `like`.
+
+    Same reference, gain, band, orientation and mains as the full-record spectrum, and
+    the same bin width where the block is long enough (a line must not be smeared wider
+    than the lock-in filter). Short blocks average fewer segments, so their spectra
+    scatter more; blocks of >= 3/resolution seconds give >= 5 averages.
+    """
+    m = like.meta
+    n = int(block * fs)
+    res = max(like.df, 1.0 / block)
+    out = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for i in range(len(z) // n):
+            piece = z[i * n:(i + 1) * n]
+            if np.isfinite(piece).mean() < 0.5:
+                continue
+            try:
+                out.append(input_spectrum(piece, fs, like.f_ref, gain=m["gain"], unit=like.unit,
+                                          resolution=res, fmin=like.f[0] - like.df,
+                                          fmax=like.f[-1], tau=m["tau"], slope_db=m["slope_db"],
+                                          orientation=m["orientation"]["used"],
+                                          mains=m["mains"], name=like.name, min_segments=1))
+            except ValueError:  # piece lost to dropped packets
+                continue
+    return out
 
 
 def _peak_ratio(nu: np.ndarray, psd: np.ndarray, pos: float, df: float) -> float:
@@ -193,6 +230,23 @@ def _peak_ratio(nu: np.ndarray, psd: np.ndarray, pos: float, df: float) -> float
     if not near.any() or ring.sum() < 5:
         return np.nan
     return float(psd[near].max() / np.median(psd[ring]))
+
+
+def detect_mains(nu: np.ndarray, psd: np.ndarray, f_ref: float, df: float) -> float:
+    """50 or 60 Hz: whichever family of harmonics stands out more (60 if neither does)."""
+    lo, hi = nu[0], nu[-1]
+    scores = {}
+    for m in (50.0, 60.0):
+        logs = []
+        for k in range(1, 10):
+            p = k * m - f_ref
+            if abs(p) < 5 * df or not (lo < p < hi and lo < -p < hi) or k * m >= 2 * f_ref:
+                continue
+            r = max(_peak_ratio(nu, psd, p, df), _peak_ratio(nu, psd, -p, df))  # either X/Y sign
+            if np.isfinite(r):
+                logs.append(np.log10(r))
+        scores[m] = float(np.mean(logs)) if logs else 0.0
+    return 50.0 if scores[50.0] > scores[60.0] + 0.3 else 60.0
 
 
 def _orientation_score(nu, psd, f_ref, mains, df) -> Tuple[float, List[int]]:
@@ -333,96 +387,40 @@ def mains_related(f: np.ndarray, mains: float = 60.0, max_den: int = 4,
     return bad
 
 
-@dataclass
-class FrequencyRanking:
-    f: np.ndarray                       # candidate frequencies (Hz)
-    sigma: Dict[str, np.ndarray]        # predicted reading noise per channel (input units rms)
-    combined: np.ndarray                # combined score (1 = typical; lower is better)
-    excluded: np.ndarray                # True where mains-related
-    best: List[Dict[str, Any]]          # top picks
-    filter: MeasurementFilter
-    units: Dict[str, str]
-
-    def table(self) -> List[Dict[str, Any]]:
-        return self.best
-
-
-def rank_frequencies(spectra: Union[NoiseSpectrum, Mapping[str, NoiseSpectrum]],
-                     filt: Optional[MeasurementFilter] = None, fmin: float = 5.0,
-                     fmax: float = 95.0, step: Optional[float] = None, n_best: int = 8,
-                     min_spacing: float = 2.0, avoid_mains: bool = True, mains: float = 60.0,
-                     max_den: int = 4, mains_tol: Optional[float] = None,
-                     weights: Optional[Mapping[str, float]] = None,
-                     lines: Optional[Mapping[str, List[Dict[str, Any]]]] = None) -> FrequencyRanking:
-    """Rank excitation frequencies by the noise a lock-in reading would see.
-
-    Each channel's predicted noise is divided by its median over [fmin, fmax], and
-    the channels are combined with a weighted geometric mean, so one quiet or
-    noisy channel does not dominate. All channels share the reference, so the pick
-    must work for all of them.
-    """
-    if isinstance(spectra, NoiseSpectrum):
-        spectra = {spectra.name or "ch": spectra}
-    filt = filt or MeasurementFilter()
-    step = step or min(s.df for s in spectra.values())
-    fc = np.arange(fmin, fmax + step / 2, step)
-    sigma = {name: predicted_noise(s, fc, filt) for name, s in spectra.items()}
-    weights = dict(weights or {})
-    logsum = np.zeros_like(fc)
-    wsum = 0.0
-    for name, sg in sigma.items():
-        w = float(weights.get(name, 1.0))
-        logsum = logsum + w * np.log(sg / np.nanmedian(sg))
-        wsum += w
-    combined = np.exp(logsum / wsum)
-
-    enbw = filt.enbw(float(np.mean([fmin, fmax])))
-    tol = mains_tol if mains_tol is not None else max(0.5, 3 * enbw)
-    excluded = mains_related(fc, mains, max_den, tol) if avoid_mains else np.zeros(fc.shape, bool)
-
-    best: List[Dict[str, Any]] = []
-    order = np.argsort(np.where(np.isfinite(combined) & ~excluded, combined, np.inf))
-    all_lines = [ln for lst in (lines or {}).values() for ln in lst]
-    for i in order:
-        if not np.isfinite(combined[i]) or excluded[i]:
-            break
-        if any(abs(fc[i] - b["f"]) < min_spacing for b in best):
-            continue
-        row: Dict[str, Any] = {"f": float(fc[i]), "score": float(combined[i])}
-        for name, sg in sigma.items():
-            row[f"{name}_noise"] = float(sg[i])
-        if all_lines:
-            near = min(all_lines, key=lambda ln: abs(ln["f"] - fc[i]))
-            row["nearest_line_f"] = near["f"]
-            row["nearest_line_tag"] = near["tag"]
-        best.append(row)
-        if len(best) >= n_best:
-            break
-    units = {name: s.unit for name, s in spectra.items()}
-    return FrequencyRanking(fc, sigma, combined, excluded, best, filt, units)
-
-
 # --------------------------------------------------------------------------
 # Time-domain checks (step 2: a candidate at real settings)
 # --------------------------------------------------------------------------
 
-def block_means(x: np.ndarray, n: int) -> np.ndarray:
-    """Means of consecutive blocks of n samples; blocks containing NaN are dropped."""
+def block_means(x: np.ndarray, n: int, window: str = "boxcar") -> np.ndarray:
+    """Averages of consecutive blocks of n samples; blocks containing NaN are dropped.
+
+    window='hann' weights each block with a Hann window (normalised to unit sum):
+    much less leakage from lines away from f, ~1.2x the white noise of a plain mean.
+    """
     x = np.asarray(x)
     m = len(x) // n
-    b = x[: m * n].reshape(m, n).mean(axis=1)
+    blocks = x[: m * n].reshape(m, n)
+    if window == "hann" and n > 2:
+        w = signal.get_window("hann", n)
+        b = blocks @ (w / w.sum())
+    elif window in ("boxcar", "hann"):
+        b = blocks.mean(axis=1)
+    else:
+        raise ValueError("window must be 'boxcar' or 'hann'")
     return b[np.isfinite(b)]
 
 
-def pixel_noise(x: np.ndarray, fs: float, dwell: float, discard: float = 0.0) -> Dict[str, float]:
+def pixel_noise(x: np.ndarray, fs: float, dwell: float, discard: float = 0.0,
+                window: str = "boxcar") -> Dict[str, float]:
     """Scatter of dwell-length averages: the noise of one pixel of a map.
 
     x may be complex (X + iY): sigma_x and sigma_y are returned separately.
     discard: seconds dropped from the start (settling).
+    window : 'boxcar' (plain mean) or 'hann' weighting within each dwell.
     """
     x = np.asarray(x)[int(round(discard * fs)):]
     n = max(1, int(round(dwell * fs)))
-    b = block_means(x, n)
+    b = block_means(x, n, window)
     if len(b) < 3:
         raise ValueError("record too short for this dwell")
     out = {"n_pixels": int(len(b)), "dwell": n / fs}

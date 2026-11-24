@@ -1,103 +1,195 @@
 # dmz_measure
 
-Lock-in streaming and noise tools for low-frequency (< 100 Hz) transport measurements
-on 2D devices. It is meant to sit next to measureme (`sweep`), not replace it: runs go
-into the same kind of numbered data folders, and it uses the qcodes SR860 objects you
-already have open.
+A fork of [measureme](https://github.com/sharpelab/measureme) (upstream: `sharpelab/measureme`)
+with SR860 streaming on top:
+* **Streamed sweeps.** `s.stream_sweep` and `s.stream_megasweep` work like `s.sweep` and
+  `s.megasweep`. Each point is averaged from the lock-in data stream, with nothing leaking
+  between points, and can be re-averaged later.
+* **Excitation frequency.** A noise survey, frequency ranking and frequency check for
+  choosing it.
 
-**v0.1 status.** SR860 ethernet streaming, plus the FFT noise survey for choosing the
-excitation frequency. It is tested offline against a simulated SR860 that streams real
-UDP packets. It has **not been run on the CryoFree yet**: start with
-`notebooks/CF_noise_survey.ipynb`.
+measureme's `sweep` package is included **unchanged**, so existing notebooks
+(`import sweep`, `sweep.Station`, `s.sweep`, `sweep_load.pload`) keep working, and upstream
+updates merge cleanly. measureme's own README is in `README_measureme.md`. GPL-3.0, like
+measureme.
 
-## Install (measurement PC)
+**Status (v0.5).** Tested offline against fake SR860s and a fake gated device that stream
+real UDP packets, through measureme's own `Station`. It has **not been run on the CryoFree
+yet.**
+
+## Install
+
+This installs both `sweep` (measureme) and `dmz_measure`:
 
 ```
-pip install -e "path\to\dmz_measure"
+pip uninstall sweep                      # a separately installed measureme, if any
+git clone https://github.com/declanmz/dmz_measure.git
+pip install -e dmz_measure
 ```
 
-Dependencies: numpy, scipy and matplotlib. Use qcodes or pyvisa to open the instruments.
-Alternatively, leave the folder next to your notebooks: the notebook falls back to
-`sys.path` if the package isn't installed.
+As with measureme, live plots need PyQt5. To pull measureme updates into the fork:
+`git fetch upstream && git merge upstream/main`.
 
-Two things streaming needs:
+## Measuring: exactly measureme, plus streaming
 
-* **VXI-11 addresses** (`TCPIP::192.168.50.x::inst0::INSTR`). The SR860 sends UDP to
-  the IP address that sent `STREAM ON` over VXI-11.
-* **The firewall open for UDP 1865–1880.** Run this once in an administrator PowerShell:
-  `New-NetFirewallRule -DisplayName "SR860 streaming" -Direction Inbound -Protocol UDP -LocalPort 1865-1880 -Action Allow`
+```python
+import sweep, dmz_measure as dm
+sweep.set_basedir('./data_03+12')
+
+s = dm.AsyncStation(measurement_config)          # = sweep.AsyncStation (dm.Station = sweep.Station)
+s.add_comment('back-gate line')
+for SR860, gain in SR860s:
+    s.fp(SR860.X, gain=gain)
+    s.fp(SR860.Y, gain=gain)
+    s.plot(Kbg2.volt, SR860.X)
+s.fp(Kbg2.curr)
+
+s.sweep(Kbg2.volt, Vbg, delay=0.6)                                  # measureme, unchanged
+r = s.stream_sweep(Kbg2.volt, Vbg, dwell=0.3, settle=None, window='hann',
+                   tau=None, slope=24, advanced=None, sync=True)     # streamed
+s.stream_megasweep(Kbg2.volt, Vbg, Ktg2.volt, Vtg, slow_delay=3, dwell=0.3)
+
+dm.refilter(r.id, dwell=0.1, window='boxcar')    # re-average the saved stream (pload format)
+dm.compare([id_up, id_down, ...], current='SR860_A')   # overlay + noise + fwd/rev table
+```
+
+What `stream_sweep` does:
+* **Same output as `s.sweep`.** Same columns, live plots, `data.tsv.gz`/`metadata.json`
+  (type `1D`, function `stream_sweep`), and run IDs.
+* **Lock-in values from the stream.** The followed SR860 X/Y/R/P parameters come from the
+  stream. Every other followed parameter (gate leakage, SR830s) is read normally at each
+  point.
+* **Lock-in settings during the sweep.** τ = largest SR860 value ≤ 1/(30 f) unless `tau`
+  is given, sync filter on, streaming at 10/τ. Restored afterwards.
+* **How a point is made.** After each gate set, skip `settle` seconds (default: lock-in
+  settling + one reference period), then average `dwell` seconds. `'hann'` weighting
+  rejects interference lines away from f far better than a plain mean (`'boxcar'`), for
+  ~1.2× the white noise.
+* **Re-averaging later.** The stream is saved as `stream.npz` in the run folder.
+* **Timing.** Samples are tied to gate steps via the host clock (the stream has no
+  timestamps), good to ~1 ms.
+* **The excitation amplitude is never changed.**
+
+## Where the time of a sweep goes
+
+```python
+s.timing(Kbg2.volt, Vbg, n=20, delay=0.6, dwell=0.3)    # per-point budget + real totals
+with dm.fast_ramp(Kbg2.volt):                            # same 5 mV chunks, one *OPC? per set
+    st = s.step_response(Kbg2.volt, 0.0, 0.05); st.plot()   # how long a step takes to settle
+    r = s.stream_sweep(Kbg2.volt, Vbg, dwell=0.3, settle=st.settle)
+dm.step_response(r.id)                                    # settle measured from the sweep itself
+```
+
+* **Why a point takes longer than `delay`.** qcodes cuts every set of a parameter with
+  `step` (5 mV on the gates) into chunks, at least `inter_delay` (5 ms) apart. With
+  `block_during_ramp(True)`, every chunk also waits for a `*OPC?` reply from the 2450.
+  Following the leakage currents adds a read per point.
+* **What `s.timing` reports.** It measures each piece, including the `*OPC?` round trip,
+  and prints the real time per point and per sweep next to measureme's delay-only
+  estimate.
+* **`dm.fast_ramp`.** Keeps exactly the same 5 mV chunks, at least 5 ms apart, but sends
+  them without waiting for a reply each time. It asks `*OPC?` once when the whole set has
+  been sent, so the call returns only when the gate is at the new value. The ramp is never
+  faster than before; it just stops paying a round trip per chunk. Use it as
+  `with dm.fast_ramp(...):` or call it once (`.undo()` reverts). On a fake 2450 (2 ms
+  write, 18 ms `*OPC?`), a 0.2 V ramp went from 1.0 s to 0.3 s.
+* **`dm.gate_steps`.** The alternative: one bigger command per sweep point. `inter_delay`
+  is scaled so long ramps keep the same rate.
+* **Instrument-timed ramps.** Not used. The 2450's built-in sweep could time the 5 ms
+  steps itself, but its manual doesn't say where the output sits after the sweep ends or
+  is aborted, so it would need a bench test first. With `fast_ramp` it would only save the
+  ~1–2 ms write per chunk anyway.
+* **`s.step_response`.** Steps the gate back and forth while streaming and measures when
+  the signal is within 1% of its final value. That covers the gate line, the device, the
+  lock-in filter, and any delay between the set call returning and the voltage changing.
+  Each step is made as one command, like a sweep point; a ramped step would mostly be
+  over before the set call returned. Use the result as `settle`.
+* **`dm.step_response(run_id)`.** Measures the same thing from a streamed sweep's own
+  steps. If it shows the sweep needed more settle, `dm.refilter(run_id, settle=...)`
+  re-averages the saved stream.
+* **Reads in streamed sweeps.** Followed parameters that aren't streamed (leakage
+  currents, SR830s) are read during the dwell: in parallel per instrument on an
+  `AsyncStation`. They add no time unless they take longer than the dwell.
 
 ## Choosing the excitation frequency
 
 ```python
-import dmz_measure as dm
+# excitation off by hand
+survey = s.noise_survey(current='SR860_A', f_ref=100, duration=600, fmin=0, fmax=200,
+                        resolution=0.05, tau=100e-6, rate=10e3)
+survey.plot(); survey.spectrogram('SR860_B', block=30)
 
-channels = {'SR860_A': dm.Channel(SR860_A, gain=1e6, unit='A'),   # current
-            'SR860_B': dm.Channel(SR860_B, gain=100),              # voltages
-            'SR860_C': dm.Channel(SR860_C, gain=100)}
+best = dm.best_frequencies(survey, fmin=10, fmax=40, tau=0.3, slope=24, advanced=False,
+                           sync=False, dwell=None, window='boxcar', block=60, stat='p90')
+dm.expected_noise(survey, [13.2943, 17.777], tau=0.3)                                    # normal
+dm.expected_noise(survey, [13.2943, 17.777], tau=1e-3, sync=True, dwell=0.3, window='hann')  # streamed
 
-# 1. survey: f_ref = 100 Hz, tau = 100 us, sync off, excitation off -> spectra 0-200 Hz
-survey = dm.noise_survey(channels, master=SR860_A, duration=300, basedir='./data_dmz')
-dm.plotting.plot_survey(survey)
-
-# 2. rank: predicted noise of one data point at every candidate frequency
-rank = survey.rank(dm.MeasurementFilter(tau=0.3), fmin=5, fmax=95)
-print(dm.format_table(rank.best))
-
-# 3. check the best few at real settings, excitation on (tau ~ 1/(30 f), sync on)
-check = dm.candidate_check(channels, master=SR860_A, current='SR860_A',
-                           frequencies=[b['f'] for b in rank.best[:4]] + [13.2943])
+# excitation on by hand, gates at a representative point
+check = s.check_frequencies(best.frequencies[:3] + [SR860_A.frequency()], current='SR860_A',
+                            tau=None, sync=True, duration=120, dwell=0.3, window='hann')
 ```
 
-How it works. With a reference at f_ref, the complex output z = X + iY is the input
-signal shifted down by f_ref. An FFT of z therefore shows the input at f = f_ref + ν. With
-the lock-in's rms normalisation, the two-sided PSD of z is the input noise density
-directly, in V/√Hz. A lock-in reading at frequency f with filter |H|² then has variance
+* **Survey.** With the reference at f_ref, the complex FFT of X + iY is the input
+  spectrum shifted by f_ref. Every SR860 in `measurement_config` is surveyed, and the
+  gains come from `s.fp`. Mains (50/60 Hz) is detected from the data.
+  `dm.load_survey(id)` reloads a survey.
+* **Choose.** The predicted noise of one reading at reference f is
+  σ² = ½ ∫ S(f′) (|H(f′ − f)|² + |H(f′ + f)|²) df′. H is the filter that makes one data
+  point:
+  * the SR860 time constant: RC stages, or Gaussian stages with `advanced=True`;
+  * the sync filter;
+  * a software `dwell` average, as a plain mean or Hann-weighted.
 
-σ² = ½ ∫ S(f′) (|H(f′ − f)|² + |H(f′ + f)|²) df′,
+  Every combination is checked against a direct software lock-in to within ±12%,
+  including next to strong lines.
+* **Time variation.** σ is computed for each `block`-second piece of the survey.
+  `stat='p90'` ranks by the noise exceeded 10% of the time, and `spread` (worst block /
+  typical block) flags intermittent noise.
+* **Check.** For each frequency it reports R = V/I, the noise of one data point, the
+  worst `block` stretch, and the phase.
 
-and that is how the candidates are ranked. The X/Y sign convention is checked
-automatically against the mains harmonics. Every lock-in setting the procedures touch is
-snapshotted and restored at the end, also on errors.
+## Notebooks
 
-The method is checked with a software lock-in on simulated input (`tests/test_noise.py`).
-The recovered noise floor and line amplitudes are within a few percent of what was put
-in, and the predicted noise matches the measured noise within ±5% (τ filter, sync, dwell
-average).
+* `notebooks/CF_noise_survey.ipynb` is for the CryoFree. It loads the same instruments as
+  the MM03 measurement notebook, then runs the survey → choose → check steps and the
+  back-gate comparison (normal vs streamed, up and down).
+* `notebooks/CF_noise_survey_SIMULATED.ipynb` runs the same steps against fake instruments
+  on any PC.
 
-## Modules
+## Firewall
 
-| module | what |
-|---|---|
-| `instruments.sr860_stream` | `SR860Stream`, `acquire_many`: UDP streaming. Header parsing follows the SR860 manual (App. D). Dropped packets become NaN. |
-| `instruments.sr860` | `LockinIO` (wraps qcodes, pyvisa or an address), `preserved_settings`, `apply_settings` |
-| `noise` | `input_spectrum`, `find_lines`, `predicted_noise`, `rank_frequencies`, `pixel_noise`, `allan_deviation`, `spectrogram` |
-| `lockin` | SR860 time-constant table, ENBW, settling times (7.1τ / 5.4τ + 1/f), `recommended_tau` = 1/(30 f), `MeasurementFilter` |
-| `procedures` | `noise_survey`, `candidate_check` |
-| `io` | `RunWriter` / `load_run`. Same ID scheme as `sweep`. Writes `metadata.json`, `data.tsv.gz`, `*.npz` and `plot.png`. |
-| `simulate` | `FakeSR860` (streams real UDP to 127.0.0.1), `fake_cryofree()`, `SoftwareLockin` |
-| `plotting` | survey / ranking / spectrogram / Allan figures |
+The SR860 sends its data as UDP packets to the PC, so Windows Firewall has to let them
+in. Allow only the instrument subnet, in an administrator PowerShell, once:
 
-Runs saved here appear in `sweep.list_measurements()` when both share a data folder.
-Their `type` is `noise_survey` or `frequency_check`.
+```
+New-NetFirewallRule -DisplayName "SR860 streaming" -Direction Inbound -Protocol UDP -LocalPort 1865-1880 -RemoteAddress 192.168.50.0/24 -Action Allow
+```
+
+The risk is small:
+* The rule only accepts packets from the 192.168.50.x instrument network.
+* Nothing listens on those ports except while a stream is running.
+* dmz_measure also drops any packet that doesn't come from the lock-in's own IP.
+* The packets are read as plain numbers, never executed.
+
+To remove the rule: `Remove-NetFirewallRule -DisplayName "SR860 streaming"`.
 
 ## Tests
 
-```
-pytest            # ~30 s; includes real UDP loopback against FakeSR860
-```
+`pytest` (~80 s; needs PyQt5 because `import sweep` selects the Qt backend). It covers:
+* the packet format;
+* the spectrum calibration and the noise prediction for every filter type, checked
+  against a software lock-in;
+* catching bursty noise;
+* stations against fake instruments: measureme's own `sweep` unchanged, `stream_sweep`
+  with the same columns and readable by `pload1d`, `stream_megasweep`, `refilter`, and
+  the survey and check from a station;
+* the timing tools against a fake gate that ramps like qcodes, with a set latency and a
+  slow gate line.
 
-Set `SIMULATE = True` in the notebook to run all of it without instruments.
-`notebooks/CF_noise_survey_SIMULATED.ipynb` is an executed copy of such a run.
+## Roadmap
 
-## Roadmap (from the SR860 streaming discussion)
-
-- [x] Stream X/Y over UDP; FFT noise survey; frequency ranking; candidate check
-- [ ] Triggered capture per line: `CAPTURESTART` with hardware trigger, a TTL from the
-      gate ramp, `CAPTUREGET?` after each line, serpentine scans
-- [ ] Continuous gate ramps: stream, bin by gate voltage, shift out the filter lag,
-      check forward vs reverse
-- [ ] Stepped maps on the short-τ recipe: τ ≈ 1/(30 f) + sync, skip ~1 period plus 7τ
-      after each step, average the rest
-- [ ] Phase diagnostics: flag θ > 5° / 15° / 20°; complex V/I; two-frequency
-      extrapolation R_dc ≈ [4X(f) − X(2f)]/3
+- [x] UDP streaming, noise survey, frequency choice with time variation, frequency check
+- [x] Streamed `stream_sweep` / `stream_megasweep` on measureme's Station, with re-averaging
+- [ ] Triggered capture per gate line (`CAPTURESTART` with a TTL from the ramp)
+- [ ] Continuous gate ramps: stream, bin by gate voltage, shift out the filter lag
+- [ ] Phase checks and the two-frequency extrapolation R_dc ≈ [4X(f) − X(2f)]/3

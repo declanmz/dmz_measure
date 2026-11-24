@@ -40,11 +40,16 @@ FIREWALL_HELP = """\
 No UDP packets from {name} arrived on port {port} within {timeout:g} s.
 Most likely causes:
   1. Windows Firewall is blocking inbound UDP. In an *administrator* PowerShell on this PC run
-       New-NetFirewallRule -DisplayName "SR860 streaming" -Direction Inbound -Protocol UDP -LocalPort 1865-1880 -Action Allow
-     and check that python.exe is allowed under "Allow an app through Windows Firewall".
+       New-NetFirewallRule -DisplayName "SR860 streaming" -Direction Inbound -Protocol UDP -LocalPort 1865-1880 -RemoteAddress {subnet} -Action Allow
+     (only the instrument subnet {subnet} is let in).
   2. STREAM ON did not come over VXI-11. Open the lock-in as TCPIP::<ip>::inst0::INSTR; the SR860
      streams to the IP address that sent STREAM ON.
   3. Another program (or another open stream) is already using port {port}."""
+
+
+def _help(name: str, port: int, timeout: float, ip: Optional[str]) -> str:
+    subnet = ip.rsplit(".", 1)[0] + ".0/24" if ip else "<instrument subnet, e.g. 192.168.50.0/24>"
+    return FIREWALL_HELP.format(name=name, port=port, timeout=timeout, subnet=subnet)
 
 
 class StreamTimeout(RuntimeError):
@@ -120,7 +125,7 @@ def decode_packet(buf: bytes) -> Tuple[PacketHeader, np.ndarray]:
     hdr = PacketHeader.from_word(word)
     dt = np.dtype(("<" if hdr.little_endian else ">") + ("i2" if hdr.is_int16 else "f4"))
     n = min(hdr.data_bytes, len(buf) - 4) // dt.itemsize
-    vals = np.frombuffer(buf, dtype=dt, count=n, offset=4).astype(np.float64)
+    vals = np.frombuffer(buf, dtype=dt, count=n, offset=4).astype(np.float32)
     nch = len(hdr.channels)
     return hdr, vals[: (n // nch) * nch].reshape(-1, nch)
 
@@ -225,13 +230,16 @@ def assemble(packets: Sequence[bytes], name: str = "", t0: float = np.nan,
     return StreamData(name=name, channels=first.channels, fs=first.sample_rate, data=data,
                       t0=t0, f_ref=f_ref, n_packets=len(packets), n_dropped=n_drop,
                       n_overload=n_ovl, n_error=n_err,
-                      info={"int16": first.is_int16, "little_endian": first.little_endian})
+                      info={"int16": first.is_int16, "little_endian": first.little_endian,
+                            "samples_per_packet": first.samples_per_packet})
 
 
 class SR860Stream:
     """Stream X/Y (or R/theta) from one SR860 over UDP.
 
-    >>> st = SR860Stream(SR860_B, port=1866)        # qcodes instrument, pyvisa resource or address
+    Only packets coming from the lock-in's own IP address are accepted.
+
+    >>> st = SR860Stream(SR860_B, port=1866)        # qcodes SR860 instrument
     >>> st.configure(rate=40e3)                      # picks the largest allowed rate <= 40 kHz
     >>> data = st.acquire(60)                        # 60 s record -> StreamData
     >>> data.z                                       # complex X + iY
@@ -261,6 +269,8 @@ class SR860Stream:
         self._packets: List[bytes] = []
         self._t_first: Optional[float] = None
         self._f_ref: Optional[float] = None
+        self.source_ip: Optional[str] = self.io.host  # None = accept any sender
+        self.n_rejected = 0
 
     def __repr__(self) -> str:
         return f"SR860Stream({self.name!r}, port={self.port})"
@@ -320,15 +330,18 @@ class SR860Stream:
         self.io.write("STREAM ON")
 
     def _recv_loop(self) -> None:
-        sock, packets = self._sock, self._packets
+        sock, packets, src = self._sock, self._packets, self.source_ip
         bufsize = 4 + 1024 + 64
         while not self._stop.is_set():
             try:
-                buf = sock.recv(bufsize)
+                buf, addr = sock.recvfrom(bufsize)
             except socket.timeout:
                 continue
             except OSError:
                 break
+            if src is not None and addr[0] != src:
+                self.n_rejected += 1  # not from our lock-in: ignore
+                continue
             if self._t_first is None:
                 self._t_first = time.time()
             packets.append(buf)
@@ -349,7 +362,7 @@ class SR860Stream:
         while self._t_first is None:
             if time.monotonic() > t_end:
                 self.stop(allow_empty=True)
-                raise StreamTimeout(FIREWALL_HELP.format(name=self.name, port=self.port, timeout=timeout))
+                raise StreamTimeout(_help(self.name, self.port, timeout, self.source_ip))
             time.sleep(0.01)
 
     def stop(self, allow_empty: bool = False, send_off: bool = True) -> Optional[StreamData]:
@@ -367,7 +380,7 @@ class SR860Stream:
         if not self._packets:
             if allow_empty:
                 return None
-            raise StreamTimeout(FIREWALL_HELP.format(name=self.name, port=self.port, timeout=0))
+            raise StreamTimeout(_help(self.name, self.port, 0, self.source_ip))
         return assemble(self._packets, name=self.name, t0=self._t_first or np.nan, f_ref=self._f_ref)
 
     def acquire(self, duration: float, rate: Optional[float] = None, timeout: float = 3.0,

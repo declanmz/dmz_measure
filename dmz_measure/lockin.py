@@ -113,53 +113,98 @@ def rc_power_response(nu, tau: float, slope_db: int = 24):
     return (1.0 + w * w) ** (-n)
 
 
+def gaussian_power_response(nu, tau: float, slope_db: int = 24):
+    """|H(nu)|^2 of the SR860 Advanced filter (tau <= 3 s): n Gaussian FIR stages.
+
+    Per the manual each RC pole is replaced by a Gaussian stage with the same noise
+    bandwidth, 1/(4 tau). A Gaussian with time-domain std tau/sqrt(pi) has exactly that,
+    |H|^2 = exp(-4 pi nu^2 tau^2), and a -3 dB point 1.48x the RC pole's (the manual
+    says 1.5x). n stages in series are one Gaussian with std sqrt(n) tau/sqrt(pi).
+    """
+    n = n_poles(slope_db)
+    return np.exp(-4 * np.pi * n * (np.asarray(nu, dtype=float) * tau) ** 2)
+
+
 def boxcar_power_response(nu, T: float):
     """|H(nu)|^2 of a plain average over a window of length T."""
     return np.sinc(np.asarray(nu, dtype=float) * T) ** 2
+
+
+def hann_power_response(nu, T: float):
+    """|H(nu)|^2 of a Hann-weighted average over a window of length T.
+
+    W = sinc(nu T) / (1 - (nu T)^2): main lobe twice as wide as the plain average's,
+    but sidelobes falling as 1/nu^3 instead of 1/nu (first one at -31 dB).
+    """
+    x = np.asarray(nu, dtype=float) * T
+    den = 1.0 - x * x
+    near = np.abs(den) < 1e-9
+    w = np.where(near, 0.5, np.sinc(x) / np.where(near, 1.0, den))
+    return w * w
+
+
+WINDOWS = ("boxcar", "hann")
 
 
 @dataclass
 class MeasurementFilter:
     """Everything that low-passes the demodulated signal before it becomes one data point.
 
-    tau, slope_db : SR860 time-constant filter (None = no RC filter)
+    tau, slope_db : SR860 time-constant filter (None = none)
+    advanced      : SR860 Advanced filter on (ADVFILT 1): Gaussian stages for tau <= 3 s
+                    (longer tau: modelled as RC, which has the same slope)
     sync          : SR860 sync filter (an average over one reference period)
     dwell         : software average over this many seconds (None = single reading)
+    window        : weighting of the samples in the dwell: 'boxcar' (plain mean) or 'hann'
 
     Examples
     --------
     Single reading with tau = 300 ms at 24 dB/oct (what a stepped gate map does):
-        MeasurementFilter(tau=0.3)
-    Short-tau streaming recipe: tau ~ 1/(30 f), sync on, average 0.3 s per pixel:
-        MeasurementFilter(tau=1e-3, sync=True, dwell=0.3)
+        MeasurementFilter(tau=0.3)                       # RC
+        MeasurementFilter(tau=0.3, advanced=True)        # Advanced (Gaussian)
+    Streaming recipe: tau ~ 1/(30 f), sync on, Hann-weighted 0.3 s average per point:
+        MeasurementFilter(tau=1e-3, sync=True, dwell=0.3, window='hann')
     """
 
     tau: Optional[float] = 0.3
     slope_db: int = 24
     sync: bool = False
     dwell: Optional[float] = None
+    advanced: bool = False
+    window: str = "boxcar"
+
+    def __post_init__(self):
+        if self.window not in WINDOWS:
+            raise ValueError(f"window must be one of {WINDOWS}")
+
+    @property
+    def gaussian(self) -> bool:
+        return bool(self.advanced and self.tau and self.tau <= 3.0 * (1 + 1e-9))
 
     def power_response(self, nu, f_ref):
         """|H(nu)|^2 at offset nu (Hz) from a reference f_ref (Hz); broadcasts."""
         nu = np.asarray(nu, dtype=float)
         h2 = np.ones(np.broadcast(nu, np.asarray(f_ref)).shape)
         if self.tau:
-            h2 = h2 * rc_power_response(nu, self.tau, self.slope_db)
+            resp = gaussian_power_response if self.gaussian else rc_power_response
+            h2 = h2 * resp(nu, self.tau, self.slope_db)
         if self.sync:
             h2 = h2 * np.sinc(nu / np.asarray(f_ref, dtype=float)) ** 2
         if self.dwell:
-            h2 = h2 * boxcar_power_response(nu, self.dwell)
+            resp = hann_power_response if self.window == "hann" else boxcar_power_response
+            h2 = h2 * resp(nu, self.dwell)
         return h2
 
     def enbw(self, f_ref: float) -> float:
         """One-sided equivalent noise bandwidth (Hz), computed numerically."""
         widths = []
         if self.tau:
-            widths.append(enbw_rc(self.tau, self.slope_db))
+            widths.append(1 / (4 * self.tau * np.sqrt(n_poles(self.slope_db))) if self.gaussian
+                          else enbw_rc(self.tau, self.slope_db))
         if self.sync:
             widths.append(f_ref / 2)
         if self.dwell:
-            widths.append(1 / (2 * self.dwell))
+            widths.append((0.75 if self.window == "hann" else 0.5) / self.dwell)
         if not widths:
             return np.inf
         w = min(widths)
@@ -171,11 +216,12 @@ class MeasurementFilter:
     def describe(self) -> str:
         parts = []
         if self.tau:
-            parts.append(f"tau={_fmt_time(self.tau)} {self.slope_db} dB/oct")
+            kind = " advanced" if self.advanced else ""
+            parts.append(f"tau={_fmt_time(self.tau)} {self.slope_db} dB/oct{kind}")
         if self.sync:
             parts.append("sync")
         if self.dwell:
-            parts.append(f"dwell={_fmt_time(self.dwell)}")
+            parts.append(f"dwell={_fmt_time(self.dwell)}{' Hann' if self.window == 'hann' else ''}")
         return ", ".join(parts) or "no filter"
 
 

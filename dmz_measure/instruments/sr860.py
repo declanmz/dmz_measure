@@ -1,18 +1,16 @@
 """Minimal SR860 command I/O: a thin wrapper, settings snapshots and restore.
 
-dmz_measure talks to the SR860 with raw commands so it works with whatever
-object you already have open:
-
-* a qcodes SR860 instrument (``.write`` / ``.ask``)  <- what the CryoFree notebooks use
-* a pyvisa resource (``.write`` / ``.query``)
-* a VISA address string such as ``'TCPIP::192.168.50.12::inst0::INSTR'``
-* :class:`dmz_measure.simulate.FakeSR860` for offline testing
+dmz_measure sends raw SR860 commands through the qcodes SR860 objects you
+already have open (``.write`` / ``.ask``); pyvisa resources (``.query``) and
+:class:`dmz_measure.simulate.FakeSR860` work too.
 
 Streaming needs the VXI-11 address form (``TCPIP::<ip>::inst0::INSTR``): the
 SR860 sends UDP packets to the IP that sent ``STREAM ON`` over VXI-11.
 """
 from __future__ import annotations
 
+import re
+import socket
 import time
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, Optional
@@ -20,9 +18,8 @@ from typing import Any, Dict, Iterable, Optional
 from .. import lockin as _lk
 
 # Settings that the noise procedures touch, and the order they are restored in.
-# SLVL (excitation) is restored last so the sample never sees an excitation at an
-# unexpected frequency.
-SETTINGS = ("OFLT", "OFSL", "SYNC", "ADVFILT", "HARM", "FREQ", "SLVL")
+# The excitation amplitude (SLVL) is deliberately absent: dmz_measure never changes it.
+SETTINGS = ("OFLT", "OFSL", "SYNC", "ADVFILT", "HARM", "FREQ")
 _INT_SETTINGS = {"OFLT", "OFSL", "SYNC", "ADVFILT", "HARM", "RSRC"}
 
 RSRC_NAMES = {0: "INT", 1: "EXT", 2: "DUAL", 3: "CHOP"}
@@ -36,18 +33,8 @@ class LockinIO:
             self.inst, self._write, self._ask = inst.inst, inst._write, inst._ask
             self.name = name or inst.name
             return
-        if isinstance(inst, str):
-            import pyvisa  # only needed for bare addresses
-
-            res = pyvisa.ResourceManager().open_resource(inst)
-            res.read_termination = "\n"
-            res.write_termination = "\n"
-            res.timeout = 10_000
-            self.inst = res
-            self.name = name or inst
-        else:
-            self.inst = inst
-            self.name = name or getattr(inst, "name", None) or type(inst).__name__
+        self.inst = inst
+        self.name = name or getattr(inst, "name", None) or type(inst).__name__
         self._write = getattr(self.inst, "write")
         ask = getattr(self.inst, "ask", None) or getattr(self.inst, "query", None)
         if ask is None:
@@ -70,6 +57,22 @@ class LockinIO:
         return int(float(self.ask(cmd)))
 
     # ---- convenience -------------------------------------------------------
+    @property
+    def host(self) -> Optional[str]:
+        """IP address of the instrument, from its VISA address (None if unknown)."""
+        inst = self.inst
+        vh = getattr(inst, "visa_handle", None)
+        for addr in (getattr(inst, "_address", None), getattr(inst, "address", None),
+                     getattr(vh, "resource_name", None), getattr(inst, "resource_name", None)):
+            if isinstance(addr, str):
+                m = re.search(r"TCPIP\d*::([^:]+)::", addr, re.IGNORECASE)
+                if m:
+                    try:
+                        return socket.gethostbyname(m.group(1))
+                    except OSError:
+                        return None
+        return None
+
     def idn(self) -> str:
         return self.ask("*IDN?")
 
@@ -94,6 +97,30 @@ def as_io(inst: Any, name: Optional[str] = None) -> LockinIO:
     return inst if isinstance(inst, LockinIO) and name is None else LockinIO(inst, name)
 
 
+def find_instrument(name: str) -> Optional[Any]:
+    """The open instrument called `name` (qcodes, or a FakeSR860), or None."""
+    from ..simulate import FakeSR860
+
+    if name in FakeSR860.registry:
+        return FakeSR860.registry[name]
+    try:
+        from qcodes.instrument import Instrument
+    except ImportError:
+        try:
+            from qcodes import Instrument
+        except ImportError:
+            return None
+    try:
+        return Instrument.find_instrument(name)
+    except Exception:
+        return None
+
+
+def is_sr860(inst: Any) -> bool:
+    """SR860/SR865 (qcodes SR86x drivers) or a FakeSR860: the lock-ins that can stream."""
+    return any(c.__name__.startswith(("SR86", "FakeSR86")) for c in type(inst).__mro__)
+
+
 def snapshot_settings(io: LockinIO) -> Dict[str, Any]:
     """Read the settings that the procedures change. Safe to call any time."""
     snap: Dict[str, Any] = {"RSRC": io.ask_int("RSRC?")}
@@ -106,8 +133,7 @@ def snapshot_settings(io: LockinIO) -> Dict[str, Any]:
 def restore_settings(io: LockinIO, snap: Dict[str, Any]) -> None:
     """Put back a snapshot from :func:`snapshot_settings`.
 
-    FREQ is only written on lock-ins with an internal reference (RSRC=INT);
-    SLVL last.
+    FREQ is only written on lock-ins with an internal reference (RSRC=INT).
     """
     for key in SETTINGS:
         if key not in snap:
@@ -120,9 +146,12 @@ def restore_settings(io: LockinIO, snap: Dict[str, Any]) -> None:
 
 def apply_settings(io: LockinIO, *, tau: Optional[float] = None,
                    slope_db: Optional[int] = None, sync: Optional[bool] = None,
-                   advanced: Optional[bool] = None, freq: Optional[float] = None,
-                   amplitude: Optional[float] = None) -> Dict[str, Any]:
-    """Write the given settings; returns what was written (tau is snapped to the SR860 table)."""
+                   advanced: Optional[bool] = None,
+                   freq: Optional[float] = None) -> Dict[str, Any]:
+    """Write the given settings; returns what was written (tau is snapped to the SR860 table).
+
+    There is intentionally no way to set the excitation amplitude here.
+    """
     done: Dict[str, Any] = {}
     if tau is not None:
         i = _lk.tau_index(tau)
@@ -140,10 +169,6 @@ def apply_settings(io: LockinIO, *, tau: Optional[float] = None,
     if freq is not None:
         io.write(f"FREQ {freq:.6f}")
         done["freq"] = freq
-    if amplitude is not None:
-        amp = max(float(amplitude), 1e-9)  # SR860 minimum is 1 nV
-        io.write(f"SLVL {amp:.6E}")
-        done["amplitude"] = amp
     return done
 
 

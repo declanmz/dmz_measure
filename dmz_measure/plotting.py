@@ -7,7 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap, LogNorm
 
-from .noise import FrequencyRanking, NoiseSpectrum
+from .noise import NoiseSpectrum
 
 # Categorical slots, always assigned in this order (validated palette, light mode)
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
@@ -64,67 +64,79 @@ def _spectra_and_lines(obj) -> tuple:
     return dict(obj), {}
 
 
-def plot_survey(survey: Any, lines: Optional[Mapping[str, list]] = None, mains: float = 60.0,
-                fmin: float = 0.0, fmax: Optional[float] = None, n_labels: int = 6,
-                figsize: Optional[tuple] = None):
-    """One panel per channel: input noise density vs frequency, mains harmonics dashed.
+def plot_survey(survey: Any, fmin: Optional[float] = None, fmax: Optional[float] = None,
+                n_labels: int = 6, figsize: Optional[tuple] = None):
+    """One panel per channel: input noise density vs frequency.
 
-    `survey` is a SurveyResult, a {name: NoiseSpectrum} dict or one NoiseSpectrum.
+    Dashed: mains harmonics. Orange dots: strongest lines.
+    `survey` is a Survey, a {name: NoiseSpectrum} dict or one NoiseSpectrum.
     """
-    spectra, found = _spectra_and_lines(survey)
-    lines = lines if lines is not None else found
+    spectra, lines = _spectra_and_lines(survey)
+    mains = getattr(survey, "mains", None) or next(iter(spectra.values())).meta.get("mains", 60.0)
+    lo = fmin if fmin is not None else min(s.f[0] for s in spectra.values())
+    hi = fmax if fmax is not None else max(s.f[-1] for s in spectra.values())
     n = len(spectra)
     with plt.rc_context(STYLE):
         fig, axes = plt.subplots(n, 1, sharex=True, figsize=figsize or (10, 2.6 * n + 0.6),
                                  squeeze=False)
         for ax, (name, s) in zip(axes[:, 0], spectra.items()):
-            hi = fmax or s.f[-1]
-            m = (s.f >= fmin) & (s.f <= hi)
+            m = (s.f >= lo) & (s.f <= hi)
             for k in range(1, int(hi // mains) + 1):
-                ax.axvline(k * mains, color=MUTED, lw=0.8, ls=(0, (4, 3)), zorder=1)
+                if k * mains >= lo:
+                    ax.axvline(k * mains, color=MUTED, lw=0.8, ls=(0, (4, 3)), zorder=1)
             ax.semilogy(s.f[m], s.asd[m], color=SERIES[0], lw=0.9, zorder=2)
-            floor = s.floor(max(fmin, 1.0), hi)
-            ax.set_title(f"{name}   floor ≈ {eng(floor, s.unit)}/√Hz", pad=4)
+            ax.set_title(f"{name}   floor ≈ {eng(s.floor(max(lo, 1.0), hi), s.unit)}/√Hz", pad=4)
             ax.set_ylabel(f"{s.unit}/√Hz")
-            for ln in (lines.get(name) or [])[:n_labels]:
-                if fmin <= ln["f"] <= hi:
-                    ax.plot(ln["f"], ln["peak_asd"], "o", ms=4, color=SERIES[1], zorder=3,
-                            mec=SURFACE, mew=0.8)
-                    lbl = f"{ln['f']:.2f}" + (f" ({ln['tag']})" if ln["tag"] else "")
-                    ax.annotate(lbl, (ln["f"], ln["peak_asd"]), xytext=(3, 3),
-                                textcoords="offset points", fontsize=8, color=INK_2)
+            shown = [ln for ln in (lines.get(name) or []) if lo <= ln["f"] <= hi][:n_labels]
+            for ln in shown:
+                ax.plot(ln["f"], ln["peak_asd"], "o", ms=4, color=SERIES[1], zorder=3,
+                        mec=SURFACE, mew=0.8)
+                lbl = f"{ln['f']:.2f}" + (f" ({ln['tag']})" if ln["tag"] else "")
+                ax.annotate(lbl, (ln["f"], ln["peak_asd"]), xytext=(3, 3),
+                            textcoords="offset points", fontsize=8, color=INK_2)
         axes[0, 0].text(1.0, 1.02, f"dashed: {mains:g} Hz harmonics   dots: strongest lines",
                         transform=axes[0, 0].transAxes, ha="right", va="bottom", fontsize=8,
                         color=INK_2)
         axes[-1, 0].set_xlabel("input frequency (Hz)")
-        axes[-1, 0].set_xlim(fmin, fmax or max(s.f[-1] for s in spectra.values()))
+        axes[-1, 0].set_xlim(lo, hi)
         fig.tight_layout()
     return fig
 
 
-def plot_ranking(rank: FrequencyRanking, n_labels: Optional[int] = None, figsize=(10, 4.2)):
-    """Predicted reading noise vs frequency, each channel relative to its own median."""
+def plot_ranking(rank: Any, figsize: Optional[tuple] = None):
+    """Predicted noise of one reading vs reference frequency, one panel per channel.
+
+    Line: the statistic used for ranking. Band: 10-90 % of the time blocks (wide band =
+    noise that comes and goes). Grey: mains-related, skipped. Triangles: the picks.
+    """
+    names = list(rank.noise)
+    n = len(names)
     with plt.rc_context(STYLE):
-        fig, ax = plt.subplots(figsize=figsize)
-        _shade(ax, rank.f, rank.excluded, label="mains-related (avoided)")
-        for i, (name, sg) in enumerate(rank.sigma.items()):
-            ax.semilogy(rank.f, sg / np.nanmedian(sg), color=SERIES[i % len(SERIES)], lw=1.2,
-                        label=name)
-        ax.semilogy(rank.f, rank.combined, color=INK, lw=2.0, label="combined")
-        best = rank.best[: n_labels or len(rank.best)]
-        for j, b in enumerate(best, start=1):
-            ax.plot(b["f"], b["score"], "o", ms=7, color=INK, mec=SURFACE, mew=1.2, zorder=5)
-            ax.annotate(str(j), (b["f"], b["score"]), xytext=(0, -13), textcoords="offset points",
-                        ha="center", fontsize=8, color=INK)
-        ax.axhline(1.0, color=MUTED, lw=0.8)
-        lo = np.nanmin(rank.combined)
-        ax.set_ylim(bottom=lo / 1.6)
-        ax.set_xlabel("excitation frequency (Hz)")
-        ax.set_ylabel("noise / channel median")
-        ax.set_title(f"Predicted noise of one reading ({rank.filter.describe()}); "
-                     "numbers = rank", pad=6)
-        ax.set_xlim(rank.f[0], rank.f[-1])
-        ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0))
+        fig, axes = plt.subplots(n, 1, sharex=True, figsize=figsize or (10, 2.4 * n + 0.6),
+                                 squeeze=False)
+        for i, (ax, name) in enumerate(zip(axes[:, 0], names)):
+            st = rank.noise[name]
+            col = SERIES[i % len(SERIES)]
+            _shade(ax, rank.f, rank.excluded)
+            if rank.block:
+                ax.fill_between(rank.f, st["p10"], st["p90"], color=col, alpha=0.22, lw=0, zorder=1)
+                if rank.stat != "median":
+                    ax.plot(rank.f, st["median"], color=col, lw=0.8, alpha=0.7, zorder=2)
+            ax.semilogy(rank.f, st[rank.stat], color=col, lw=1.5, zorder=2)
+            tr = ax.get_xaxis_transform()
+            for j, b in enumerate(rank.best, start=1):
+                ax.plot(b["f"], b[name], "^", ms=7, color=INK, mec=SURFACE, mew=0.8, zorder=4)
+                ax.annotate(str(j), (b["f"], b[name]), xytext=(0, -13), textcoords="offset points",
+                            ha="center", fontsize=8, color=INK)
+            ax.set_title(name, pad=4)
+            ax.set_ylabel(rank.units[name] + " rms")
+        how = (f"thick: {rank.stat}   thin: median   band: 10-90 % of {rank.block:g} s blocks"
+               if rank.block else f"line: {rank.stat}")
+        axes[0, 0].text(1.0, 1.02, f"{rank.filter.describe()}   {how}   ▲ picks   grey: mains-related",
+                        transform=axes[0, 0].transAxes, ha="right", va="bottom", fontsize=8,
+                        color=INK_2)
+        axes[-1, 0].set_xlabel("reference frequency (Hz)")
+        axes[-1, 0].set_xlim(rank.f[0], rank.f[-1])
         fig.tight_layout()
     return fig
 
@@ -161,7 +173,10 @@ def plot_spectrogram(t: np.ndarray, f: np.ndarray, psd: np.ndarray, name: str = 
 
 
 def plot_check(check: Any, figsize: Optional[tuple] = None):
-    """Allan deviation of X per channel (one panel each), one line per candidate frequency."""
+    """Allan deviation of X per channel (one panel each), one line per candidate frequency.
+
+    Falling like 1/sqrt(time) = averaging still helps; flattening or rising = drift.
+    """
     freqs = list(check.allan)
     names = list(check.allan[freqs[0]]) if freqs else []
     n = len(names)

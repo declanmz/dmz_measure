@@ -6,7 +6,11 @@ import numpy as np
 import pytest
 
 import dmz_measure as dm
+from dmz_measure.io import RunWriter
 from dmz_measure.simulate import fake_cryofree
+
+CONFIG = {"SR860_A": "9-12", "SR860_B": "15-14", "SR860_C": "15-11", "Vbg2": "13", "Vtg2": "16"}
+GAINS = {"SR860_A": 1e6, "SR860_B": 100, "SR860_C": 100}
 
 
 @pytest.fixture()
@@ -17,64 +21,71 @@ def rig():
         f.close()
 
 
-def channels(f):
-    return {
-        "SR860_A": dm.Channel(f["SR860_A"], gain=1e6, unit="A"),
-        "SR860_B": dm.Channel(f["SR860_B"], gain=100),
-        "SR860_C": dm.Channel(f["SR860_C"], gain=100),
-    }
-
-
-def test_noise_survey_end_to_end(rig, tmp_path):
+def test_survey_pick_expected_reload(rig, tmp_path):
     a = rig["SR860_A"]
+    a.amplitude(0)  # excitation off by hand
     before = (a.freq, a.slvl, a.oflt)
-    res = dm.noise_survey(channels(rig), master=a, f_ref=100.0, duration=8.0, resolution=0.5,
-                          target_rate=10e3, settle=0.5, base_port=18700,
-                          basedir=str(tmp_path), comment="test survey")
-    # settings restored
+    sv = dm.noise_survey(CONFIG, GAINS, current="SR860_A", f_ref=100, duration=12, fmax=150,
+                         resolution=0.2, rate=5e3, basedir=str(tmp_path))
+    # settings restored, the excitation never touched, 'Vbg2'/'Vtg2' ignored
     assert (a.freq, a.slvl, a.oflt) == before
     assert rig["SR860_B"].sync == 0 and rig["SR860_B"].oflt == before[2]
-    # spectra are input referred: B's white level is 1e-6 V/rtHz at the lock-in -> 1e-8 at the sample
-    sB = res.spectra["SR860_B"]
-    assert sB.floor(30, 55) == pytest.approx(1e-8, rel=0.3)
-    assert res.spectra["SR860_A"].unit == "A"
-    assert any(ln["tag"] == "mains" for ln in res.lines["SR860_B"])
-    # saved in sweep-compatible form
-    run = dm.load_run(res.run_id, str(tmp_path))
-    assert run.metadata["type"] == "noise_survey"
-    assert run.metadata["interrupted"] is False
-    assert "start_time" in run.metadata and "end_time" in run.metadata
-    assert run.table["f_Hz"].size > 10
-    ts = run.arrays("timeseries")
-    assert ts["SR860_B_z"].dtype == np.complex64
+    assert list(sv.spectra) == ["SR860_A", "SR860_B", "SR860_C"]
+    assert sv.mains == 60.0
+    assert sv.spectra["SR860_B"].f[-1] <= 150
+    # input referred: B's white level 1e-6 V/rtHz at the lock-in -> 1e-8 at the sample
+    assert sv.spectra["SR860_B"].floor(30, 55) == pytest.approx(1e-8, rel=0.3)
+    assert sv.spectra["SR860_A"].unit == "A"
+
+    best = dm.best_frequencies(sv, 15, 35, tau=0.1, n=3, block=4)
+    assert len(best.frequencies) == 3 and all(15 <= f <= 35 for f in best.frequencies)
+    rows = dm.expected_noise(sv, [13.2943, 25.0], tau=0.1)
+    assert len(rows) == 2 and rows[0]["SR860_B_mean"] > 0
+
+    again = dm.load_survey(sv.run_id, str(tmp_path))
+    np.testing.assert_allclose(again.spectra["SR860_B"].psd, sv.spectra["SR860_B"].psd, rtol=1e-6)
+    run = dm.load_run(sv.run_id, str(tmp_path))
+    assert run.metadata["type"] == "noise_survey" and run.metadata["interrupted"] is False
     assert os.path.exists(os.path.join(run.dir, "plot.png"))
-    # ranking works on the result
-    r = res.rank(dm.MeasurementFilter(tau=0.3), fmin=5, fmax=95, n_best=3)
-    assert len(r.best) == 3
 
 
-def test_candidate_check_end_to_end(rig, tmp_path):
+def test_check_frequencies(rig, tmp_path):
     a = rig["SR860_A"]
     before = (a.freq, a.slvl, a.oflt, a.sync)
-    res = dm.candidate_check(channels(rig), master=a, frequencies=[17.77, 33.3], duration=3.0,
-                             dwell=0.2, current="SR860_A", base_port=18710, settle=0.3,
-                             basedir=str(tmp_path))
+    ck = dm.check_frequencies(CONFIG, [17.77, a.frequency()], GAINS, current="SR860_A",
+                              tau=None, sync=True, duration=3.0, dwell=0.1, block=1.0,
+                              basedir=str(tmp_path))
     assert (a.freq, a.slvl, a.oflt, a.sync) == before
-    assert [r["f"] for r in res.rows] == [17.77, 33.3]
-    r = res.rows[0]
+    assert [r["f"] for r in ck.rows] == [17.77, pytest.approx(13.2943)]
+    r = ck.rows[0]
     # A: 1 V / 10 MOhm = 100 nA; B: 100 nA * 1 kOhm = 100 uV  ->  R_B = 1 kOhm
-    assert abs(r["SR860_A_X"]) == pytest.approx(1e-7, rel=0.05)
-    assert r["SR860_B_R"] == pytest.approx(1000, rel=0.05)
+    assert r["SR860_A_value"] == pytest.approx(1e-7, rel=0.05)
+    assert r["SR860_B_value"] == pytest.approx(1000, rel=0.05)
     assert r["SR860_B_rel_noise"] < 0.05
-    assert set(res.allan[17.77]) == {"SR860_A", "SR860_B", "SR860_C"}
-    run = dm.load_run(res.run_id, str(tmp_path))
-    assert run.metadata["type"] == "frequency_check"
-    assert run.table["f"].tolist() == [17.77, 33.3]
+    assert r["SR860_B_rel_noise_worst"] >= 0.5 * r["SR860_B_rel_noise"]
+    assert "SR860_B R" in repr(ck)
+    assert dm.load_run(ck.run_id, str(tmp_path)).metadata["type"] == "frequency_check"
+
+
+def test_fixed_tau_is_used(rig):
+    ck = dm.check_frequencies(CONFIG, [21.0], GAINS, current="SR860_A", tau=3e-3, sync=False,
+                              duration=1.5, dwell=0.1)
+    assert ck.rows[0]["tau"] == pytest.approx(3e-3) and ck.rows[0]["sync"] is False
+
+
+def test_basedir_follows_sweep(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    fake_sweep = types.ModuleType("sweep.sweep")
+    fake_sweep.BASEDIR = str(tmp_path / "data")
+    monkeypatch.setitem(sys.modules, "sweep.sweep", fake_sweep)
+    assert dm.io.get_basedir() == str(tmp_path / "data")
 
 
 def test_runwriter_ids_and_sweep_compat(tmp_path):
     os.mkdir(tmp_path / "0")  # pretend sweep already wrote run 0
-    with dm.RunWriter(str(tmp_path), "noise_survey", comment="hi") as w:
+    with RunWriter(str(tmp_path), "noise_survey", comment="hi") as w:
         w.write_table(["a", "b"], np.c_[[1, 2], [3, 4]])
     assert w.id == 1
     with open(tmp_path / "1" / "metadata.json") as f:
@@ -83,3 +94,4 @@ def test_runwriter_ids_and_sweep_compat(tmp_path):
         assert key in md
     with gzip.open(tmp_path / "1" / "data.tsv.gz", "rt") as f:
         assert np.loadtxt(f).shape == (2, 2)
+

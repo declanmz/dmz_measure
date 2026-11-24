@@ -12,7 +12,7 @@ PORT = 18650
 def test_single_stream_loopback():
     li = FakeSR860("L", freq=100.0, tau=100e-6, seed=1)
     st = SR860Stream(li, port=PORT)
-    rate = st.configure(rate=40e3)
+    rate = st.configure(rate=10e3)       # largest max / 2**n that is <= 10 kHz
     assert rate == pytest.approx(li.max_stream_rate() / 4)
     d = st.acquire(1.5, progress=False)
     assert d.fs == pytest.approx(rate)
@@ -24,7 +24,7 @@ def test_single_stream_loopback():
 
 
 def test_many_streams_and_external_reference():
-    fakes = fake_cryofree(seed=5)
+    fakes = {k: v for k, v in fake_cryofree(seed=5).items() if isinstance(v, FakeSR860)}
     for f in fakes.values():
         dm.apply_settings(dm.LockinIO(f), tau=1e-3)
     streams = [SR860Stream(f, port=PORT + 1 + i) for i, f in enumerate(fakes.values())]
@@ -59,13 +59,15 @@ def test_no_packets_raises_with_firewall_help():
         SR860Stream(_Silent(), port=PORT + 9).acquire(0.5, timeout=0.5, progress=False)
 
 
-def test_settings_snapshot_restore():
+def test_settings_snapshot_restore_never_touches_excitation():
     f = FakeSR860("x", freq=13.2943, amplitude=0.5, tau=0.3)
+    sent = []
+    write = f.write
+    f.write = lambda cmd: (sent.append(cmd), write(cmd))[1]
     io = dm.LockinIO(f)
     with dm.preserved_settings([io], verbose=False):
-        dm.apply_settings(io, tau=1e-4, slope_db=12, sync=True, freq=100.0, amplitude=0)
-        assert f.slvl == pytest.approx(1e-9)
+        dm.apply_settings(io, tau=1e-4, slope_db=12, sync=True, freq=100.0)
     assert f.freq == pytest.approx(13.2943)
-    assert f.slvl == pytest.approx(0.5)
     assert dm.lockin.tau_from_index(f.oflt) == pytest.approx(0.3)
     assert f.sync == 0 and f.ofsl == 3
+    assert not any(c.upper().startswith("SLVL") for c in sent)

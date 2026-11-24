@@ -14,6 +14,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Sequence
@@ -24,15 +25,18 @@ _BASEDIR: Optional[str] = None
 
 
 def set_basedir(path: str) -> None:
-    """Default data folder for runs (like ``sweep.set_basedir``)."""
+    """Default data folder for runs (otherwise sweep's folder from sweep.set_basedir is used)."""
     global _BASEDIR
     _BASEDIR = path
 
 
-def get_basedir(basedir: Optional[str] = None) -> str:
-    path = basedir or _BASEDIR
+def get_basedir(basedir: Optional[str] = None, required: bool = True) -> Optional[str]:
+    """basedir argument > dmz_measure.set_basedir > sweep.set_basedir."""
+    path = basedir or _BASEDIR or getattr(sys.modules.get("sweep.sweep"), "BASEDIR", None)
     if path is None:
-        raise ValueError("no data folder: pass basedir=... or call dmz_measure.set_basedir(...)")
+        if required:
+            raise ValueError("no data folder: call sweep.set_basedir(...) or pass basedir=...")
+        return None
     return os.path.expanduser(path)
 
 
