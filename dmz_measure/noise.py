@@ -213,13 +213,15 @@ def block_spectra(z: np.ndarray, fs: float, like: NoiseSpectrum, block: float) -
             if np.isfinite(piece).mean() < 0.5:
                 continue
             try:
-                out.append(input_spectrum(piece, fs, like.f_ref, gain=m["gain"], unit=like.unit,
-                                          resolution=res, fmin=like.f[0] - like.df,
-                                          fmax=like.f[-1], tau=m["tau"], slope_db=m["slope_db"],
-                                          orientation=m["orientation"]["used"],
-                                          mains=m["mains"], name=like.name, min_segments=1))
+                spec = input_spectrum(piece, fs, like.f_ref, gain=m["gain"], unit=like.unit,
+                                      resolution=res, fmin=like.f[0] - like.df,
+                                      fmax=like.f[-1], tau=m["tau"], slope_db=m["slope_db"],
+                                      orientation=m["orientation"]["used"],
+                                      mains=m["mains"], name=like.name, min_segments=1)
             except ValueError:  # piece lost to dropped packets
                 continue
+            spec.meta["block"] = i  # block number, to pair blocks of different channels
+            out.append(spec)
     return out
 
 
@@ -234,13 +236,13 @@ def _peak_ratio(nu: np.ndarray, psd: np.ndarray, pos: float, df: float) -> float
 
 def detect_mains(nu: np.ndarray, psd: np.ndarray, f_ref: float, df: float) -> float:
     """50 or 60 Hz: whichever family of harmonics stands out more (60 if neither does)."""
-    lo, hi = nu[0], nu[-1]
+    lo, hi = 0.9 * nu[0], 0.9 * nu[-1]   # stay clear of the decimation filter's edge
     scores = {}
     for m in (50.0, 60.0):
         logs = []
         for k in range(1, 10):
             p = k * m - f_ref
-            if abs(p) < 5 * df or not (lo < p < hi and lo < -p < hi) or k * m >= 2 * f_ref:
+            if abs(p) < 5 * df or not (lo < p < hi and lo < -p < hi):
                 continue
             r = max(_peak_ratio(nu, psd, p, df), _peak_ratio(nu, psd, -p, df))  # either X/Y sign
             if np.isfinite(r):
@@ -250,17 +252,23 @@ def detect_mains(nu: np.ndarray, psd: np.ndarray, f_ref: float, df: float) -> fl
 
 
 def _orientation_score(nu, psd, f_ref, mains, df) -> Tuple[float, List[int]]:
-    """Sum over usable mains harmonics of log10(power at +nu_k / power at -nu_k)."""
-    lo, hi = nu[0], nu[-1]
+    """Sum over usable mains harmonics of log10(power at +nu_k / power at -nu_k).
+
+    Harmonics outside the kept band (above 2 f_ref) count too: the stream reaches far beyond
+    it, so a 25 Hz survey (band 0 - 50 Hz) still sees 60, 120, 180 Hz at +35, +95, +155 Hz.
+    What sits at -nu_k comes from input frequency |f_ref - nu_k| (directly below 2 f_ref, as
+    the image of the sum frequency above), so a harmonic is skipped when that is one too.
+    """
+    lo, hi = 0.9 * nu[0], 0.9 * nu[-1]   # stay clear of the decimation filter's edge
     harmonics = [k * mains for k in range(1, 64)]
     score, used = 0.0, []
     for k, fk in enumerate(harmonics, start=1):
         p = fk - f_ref  # where harmonic k lands if orientation is normal
         if abs(p) < 5 * df or not (-f_ref < p < hi) or not (lo < -p < hi):
             continue
-        # skip if the mirror position is itself (near) another harmonic
-        mirror_f = f_ref - p
-        if any(abs(mirror_f - h) < 5 * df for h in harmonics) or mirror_f <= 0:
+        # skip if the mirror position is itself fed by (near) another harmonic or DC
+        mirror_f = abs(f_ref - p)
+        if any(abs(mirror_f - h) < 5 * df for h in harmonics) or mirror_f < 5 * df:
             continue
         r_plus = _peak_ratio(nu, psd, p, df)
         r_minus = _peak_ratio(nu, psd, -p, df)

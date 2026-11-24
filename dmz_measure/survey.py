@@ -1,111 +1,67 @@
-"""Steps 1 and 2: measure the noise spectrum, then choose frequencies from it.
+"""Noise survey analysis and choosing the excitation frequency. No instruments: everything
+works from the run ID of a survey measured with ``s.noise_survey``.
 
-    survey = dm.noise_survey(measurement_config, gains, current='SR860_A', f_ref=100, duration=600)
-    best = dm.best_frequencies(survey, fmin=10, fmax=40, tau=0.3)
-    dm.expected_noise(survey, [13.2943, 17.5], tau=0.3)
+    survey = dm.load_survey(run_id, current='SR860_A')      # spectra from the saved stream
+    survey.plot(); survey.spectrogram('SR860_B')
+    best = dm.best_frequencies(survey, resistances={'SR860_B': 106}, excitation=2e-9,
+                               fmin=1, fmax=49, tau=0.3)
+    dm.expected_noise(survey, [13.2943, 17.5623], resistances={'SR860_B': 106},
+                      excitation=2e-9, tau=0.3)
 
-The survey streams every SR860 in ``measurement_config`` with the reference at
-f_ref, a short time constant and the sync filter off. The complex FFT of X + iY
-is the input spectrum shifted by f_ref, so one record gives each channel's
-input-referred noise density over the band [fmin, fmax] (anything 0 < f < f_ref +
-fs/2 is unambiguous).
+Spectra: the lock-ins streamed X + iY at reference f_ref with a short time constant. The
+complex FFT of that record is the input spectrum shifted by f_ref, so one record gives each
+lock-in's input-referred noise density from 0 to 2 f_ref.
 
-Choosing frequencies is pure analysis of a survey (live or reloaded with
-:func:`load_survey`). The predicted noise of one lock-in reading at reference f is
+Resistance noise: a data point at reference frequency f reads the voltage V and the current I
+with noise sigma_V(f) and sigma_I(f): the part of the measured spectra that passes the
+lock-in filter you will use (tau, slope, sync, dwell; see noise.predicted_noise). For
+R = V / I, excitation current I and a typical resistance R of the channel, with the voltage
+and current noise independent of each other,
 
-    sigma^2 = 1/2 * integral S(f') (|H(f' - f)|^2 + |H(f' + f)|^2) df'
+    sigma_R = sqrt(sigma_V^2 + (R sigma_I)^2) / I
 
-with H the filter that makes one data point (tau, slope, sync, dwell). To catch
-noise that comes and goes, the record is also cut into time blocks and sigma is
-evaluated for each block: a frequency that is quiet on average but noisy in some
-blocks shows a large spread (max/median) and is pushed down by ranking on the
-90th percentile instead of the mean.
-
-The code never changes the excitation amplitude. It changes the reference
-frequency and filter settings, and restores them at the end.
+Frequencies are ranked by the worst sigma_R / R among the voltage channels you list. To catch
+noise that comes and goes, the survey is cut into `block`-second pieces and sigma_R is worked
+out for each piece: ranking on the 90th percentile ('p90') pushes down frequencies that are
+quiet on average but noisy part of the time.
 """
 from __future__ import annotations
 
+import os
 import warnings
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 from . import lockin as lk
 from . import noise as nz
-from .instruments.sr860 import (LockinIO, apply_settings, find_instrument, is_sr860,
-                                preserved_settings, wait_for_lock)
-from .instruments.sr860_stream import DEFAULT_PORT, SR860Stream, acquire_many
-from .io import RunWriter, get_basedir, load_run
-from .plotting import eng
+from .io import load_run
+from .plotting import eng, hz, pct
+from .sweeps import _npz_to_segments
 
 
 # --------------------------------------------------------------------------
-# shared helpers (also used by check.py)
-# --------------------------------------------------------------------------
-
-@dataclass
-class _Lockin:
-    name: str
-    io: LockinIO
-    gain: float
-    unit: str
-
-
-def lockins_from_config(measurement_config: Mapping[str, Any],
-                        gains: Optional[Mapping[str, float]],
-                        current: Optional[str]) -> Dict[str, _Lockin]:
-    """The open SR860s named in measurement_config (other entries are ignored)."""
-    gains = dict(gains or {})
-    out: Dict[str, _Lockin] = {}
-    for name in measurement_config:
-        inst = find_instrument(name)
-        if inst is None:
-            continue  # e.g. 'Vbg2': a label, not an instrument
-        if not is_sr860(inst):
-            if "SR830" in type(inst).__name__:
-                print(f"{name}: SR830s can't stream, skipped")
-            continue
-        out[name] = _Lockin(name, LockinIO(inst, name), float(gains.get(name, 1.0)),
-                            "A" if name == current else "V")
-    if not out:
-        raise RuntimeError("none of the measurement_config entries is an open SR860")
-    if current is not None and current not in out:
-        raise ValueError(f"current={current!r} is not one of the lock-ins {list(out)}")
-    return out
-
-
-def reference_lockins(lockins: Dict[str, _Lockin], snaps: Dict[str, Dict]) -> List[LockinIO]:
-    """Lock-ins on internal reference: they set the frequency, the others follow."""
-    refs = [l.io for l in lockins.values() if snaps[l.name]["RSRC"] == 0]
-    if not refs:
-        raise RuntimeError("no lock-in in measurement_config is on internal reference")
-    return refs
-
-
-def start_streams(lockins: Dict[str, _Lockin], rate: float) -> List[SR860Stream]:
-    streams = [SR860Stream(l.io, port=DEFAULT_PORT + i) for i, l in enumerate(lockins.values())]
-    for st in streams:
-        st.configure(rate=rate)
-    return streams
-
-
-# --------------------------------------------------------------------------
-# Step 1: survey
+# Loading a survey
 # --------------------------------------------------------------------------
 
 @dataclass
 class Survey:
     spectra: Dict[str, nz.NoiseSpectrum]   # whole-record spectra, input referred
-    z: Dict[str, np.ndarray]               # X + iY, input referred, decimated
+    z: Dict[str, np.ndarray]               # X + iY, input referred (gain divided out)
     fs: Dict[str, float]                   # sample rate of z
     lines: Dict[str, List[Dict[str, Any]]]
     mains: float
     settings: Dict[str, Any]
     run_id: Optional[int] = None
+    comments: List[str] = field(default_factory=list)
     _blocks: Dict[float, Dict[str, List[nz.NoiseSpectrum]]] = field(default_factory=dict, repr=False)
+
+    @property
+    def current(self) -> str:
+        """The lock-in that measures the current."""
+        return self.settings["current"]
 
     def plot(self, fmin: Optional[float] = None, fmax: Optional[float] = None):
         """Noise density of each channel, mains harmonics and the strongest lines marked."""
@@ -133,10 +89,12 @@ class Survey:
     def __repr__(self) -> str:
         st = self.settings
         L = [f"Noise survey{f' (run {self.run_id})' if self.run_id is not None else ''}: "
-             f"{', '.join(self.spectra)}",
-             f"  f_ref {st['f_ref']:g} Hz, {st['duration']:g} s, band {st['fmin']:g}-{st['fmax']:g} Hz, "
-             f"bins {next(iter(self.spectra.values())).df:.3g} Hz, tau {lk._fmt_time(st['tau'])}, "
-             f"mains {self.mains:g} Hz"]
+             f"{', '.join(self.spectra)}; current: {self.current}"]
+        for c in self.comments:
+            L.append(f"  comment: {c}")
+        L.append(f"  f_ref {hz(st['f_ref'])} Hz, {st['duration']:.0f} s, band {hz(st['fmin'])}-"
+                 f"{hz(st['fmax'])} Hz, bins {next(iter(self.spectra.values())).df:.4g} Hz, "
+                 f"tau {lk._fmt_time(st['tau'])}, mains {self.mains:g} Hz")
         for n, s in self.spectra.items():
             L.append(f"  {n}: floor {eng(s.floor(), s.unit)}/√Hz ({s.n_segments} averages)")
         seen: List[Dict[str, Any]] = []
@@ -145,73 +103,50 @@ class Survey:
                 seen.append(ln)
         if seen:
             L.append("  strongest lines (Hz): " + ", ".join(
-                f"{ln['f']:.2f}" + (f" ({ln['tag']})" if ln["tag"] else "") for ln in seen[:8]))
+                f"{ln['f']:.3f}" + (f" ({ln['tag']})" if ln["tag"] else "") for ln in seen[:8]))
         return "\n".join(L)
 
 
-def noise_survey(measurement_config: Mapping[str, Any], gains: Optional[Mapping[str, float]] = None,
-                 current: Optional[str] = None, *, f_ref: float = 100.0, duration: float = 600.0,
-                 fmin: float = 0.0, fmax: Optional[float] = None, resolution: float = 0.05,
-                 tau: float = 100e-6, rate: float = 10e3, basedir: Optional[str] = None,
-                 comment: str = "") -> Survey:
-    """Step 1: stream all SR860s in measurement_config and take the FFT. Turn the excitation off first.
+def load_survey(run_id: int, current: Optional[str] = None, resolution: float = 0.05,
+                fmin: float = 0.0, fmax: Optional[float] = None,
+                basedir: Optional[str] = None) -> Survey:
+    """Spectra of a saved noise survey (s.noise_survey, or a survey from dmz_measure 0.6).
 
-    f_ref      : reference frequency during the survey (Hz)
-    duration   : seconds of streaming
+    current    : the lock-in that measures the current (its spectrum is in A/√Hz)
+    resolution : FFT bin width (Hz); Welch segments of 1/resolution s, 50 % overlap
     fmin, fmax : band of input frequencies to keep (Hz); fmax defaults to 2 f_ref
-    resolution : FFT bin width (Hz); Welch segments are 1/resolution s, 50 % overlap
-    tau        : lock-in time constant during the survey (keep it <= 100 us so the band is flat)
-    rate       : stream sample rate (Hz); ~100x the band is plenty against aliasing
-    gains      : preamp gains to divide out; current: the lock-in that measures current
-    basedir    : data folder (default: the one from dm.set_basedir)
     """
-    fmax = 2 * f_ref if fmax is None else fmax
-    lockins = lockins_from_config(measurement_config, gains, current)
-    ios = [l.io for l in lockins.values()]
-    with preserved_settings(ios) as snaps:
-        refs = reference_lockins(lockins, snaps)
-        for io in refs:
-            apply_settings(io, freq=f_ref)
-        for io in ios:
-            apply_settings(io, tau=tau, slope_db=24, sync=False)
-        wait_for_lock(ios, minimum=3.0)
-        f_det = {n: l.io.detection_frequency() for n, l in lockins.items()}
-        tau_set = lockins[next(iter(lockins))].io.time_constant()
-        streams = start_streams(lockins, rate)
-        print(f"Streaming {', '.join(lockins)} for {duration:g} s at {streams[0].rate:g} Hz "
-              f"(f_ref {f_ref:g} Hz, tau {lk._fmt_time(tau_set)}) ...")
-        data = acquire_many(streams, duration)
-
-    # keep only what the band needs: decimate to >= 4x the largest offset from f_ref
-    half = max(abs(fmin - f_ref), abs(fmax - f_ref), 1.0)
-    z, fs = {}, {}
-    for n, l in lockins.items():
-        d = data[n]
-        q = int(2 ** max(0, np.floor(np.log2(d.fs / (4 * half)))))
-        z[n] = (nz.decimate(d.z, q) / l.gain).astype(np.complex64)
-        fs[n] = d.fs / q
-    settings = dict(f_ref=f_ref, duration=duration, fmin=fmin, fmax=fmax, resolution=resolution,
-                    tau=tau_set, rate=streams[0].rate, f_det=f_det,
-                    units={n: l.unit for n, l in lockins.items()},
-                    gains={n: l.gain for n, l in lockins.items()},
-                    dropped={n: d.n_dropped for n, d in data.items()},
-                    overload={n: d.n_overload for n, d in data.items()})
-    del data
-    survey = _build_survey(z, fs, settings)
-
-    base = get_basedir(basedir, required=False)
-    if base:
-        _save_survey(survey, base, comment or f"noise survey f_ref {f_ref:g} Hz",
-                     measurement_config)
+    run = load_run(run_id, basedir)
+    md = run.metadata
+    if md.get("function") == "noise_survey":
+        ss = md["stream"]
+        gains = ss["gains"]
+        seg = _npz_to_segments(os.path.join(run.dir, "stream.npz"), list(gains))[0]
+        z = {n: s["z"] / gains[n] for n, s in seg["streams"].items()}
+        fs = {n: s["fs"] for n, s in seg["streams"].items()}
+        n0 = next(iter(z))
+        st = {"f_ref": ss["f_ref"], "tau": ss["tau"], "f_det": ss["f_det"], "gains": gains,
+              "rate": ss.get("rate"), "flags": ss.get("flags", {}),
+              "duration": len(z[n0]) / fs[n0]}
+    elif md.get("type") == "noise_survey":   # saved by dmz_measure 0.6: already input referred
+        st = dict(md["settings"])
+        arr = run.arrays("timeseries")
+        z = {n: arr[f"{n}_z"] for n in st["units"]}
+        fs = {n: float(arr[f"{n}_fs"]) for n in st["units"]}
+        if current is None:
+            current = next((n for n, u in st["units"].items() if u == "A"), None)
     else:
-        print("Not saved: no data folder (call dm.set_basedir(...) or pass basedir=...)")
-    print(survey)
-    return survey
+        raise ValueError(f"run {run_id} is not a noise survey")
+    if current not in z:
+        raise ValueError(f"current= must be the lock-in that measures the current: one of {list(z)}")
+    st.update(current=current, units={n: ("A" if n == current else "V") for n in z},
+              resolution=resolution, fmin=fmin, fmax=2 * st["f_ref"] if fmax is None else fmax)
+    return _build_survey(z, fs, st, run_id, list(md.get("comments") or []))
 
 
-def _build_survey(z, fs, st, run_id=None) -> Survey:
+def _build_survey(z, fs, st, run_id=None, comments=()) -> Survey:
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore")  # orientation notes are reported in the summary below
+        warnings.simplefilter("ignore")  # orientation notes are reported in the summary
         spectra = {n: nz.input_spectrum(z[n], fs[n], st["f_det"][n], unit=st["units"][n],
                                         resolution=st["resolution"], fmin=st["fmin"],
                                         fmax=st["fmax"], tau=st["tau"], name=n) for n in z}
@@ -222,68 +157,16 @@ def _build_survey(z, fs, st, run_id=None) -> Survey:
     for n, s in spectra.items():
         on = [ln for ln in lines[n] if abs(ln["f"] - s.f_ref) < 3 * s.df]
         if on:
-            print(f"NOTE {n}: strong signal at f_ref = {s.f_ref:g} Hz "
-                  f"({eng(on[0]['rms'], s.unit)} rms) - is the excitation still on?")
-    return Survey(spectra, z, fs, lines, mains, st, run_id)
-
-
-def _save_survey(sv: Survey, base, comment, measurement_config) -> None:
-    import matplotlib.pyplot as plt
-
-    names = list(sv.spectra)
-    f0 = sv.spectra[names[0]].f
-    cols = ["f_Hz"] + [f"{n}_asd_{sv.spectra[n].unit}_per_rtHz" for n in names]
-    table = [f0] + [np.interp(f0, sv.spectra[n].f, sv.spectra[n].asd) for n in names]
-    with RunWriter(base, "noise_survey", comment, dict(measurement_config)) as w:
-        w.metadata.update(settings=sv.settings, mains=sv.mains, lines=sv.lines)
-        w.write_table(cols, np.column_stack(table))
-        w.save_arrays("timeseries.npz", **{f"{n}_z": sv.z[n] for n in names},
-                      **{f"{n}_fs": np.array(sv.fs[n]) for n in names})
-        fig = sv.plot()
-        w.save_figure(fig)
-        plt.close(fig)
-        sv.run_id = w.id
-    print(f"Saved run {sv.run_id} in {base}")
-
-
-def load_survey(run_id: int, basedir: Optional[str] = None) -> Survey:
-    """Reload a saved survey (spectra are recomputed from the stored time series)."""
-    run = load_run(run_id, basedir)
-    if run.metadata.get("type") != "noise_survey":
-        raise ValueError(f"run {run_id} is a {run.metadata.get('type')!r}, not a noise_survey")
-    st = run.metadata["settings"]
-    arr = run.arrays("timeseries")
-    names = list(st["units"])
-    return _build_survey({n: arr[f"{n}_z"] for n in names},
-                         {n: float(arr[f"{n}_fs"]) for n in names}, st, run_id)
+            print(f"NOTE {n}: strong signal at f_ref = {hz(s.f_ref)} Hz "
+                  f"({eng(on[0]['rms'], s.unit)} rms) - was the excitation on?")
+    return Survey(spectra, z, fs, lines, mains, st, run_id, list(comments))
 
 
 # --------------------------------------------------------------------------
-# Step 2: choosing frequencies (analysis only)
+# Resistance noise from the spectra
 # --------------------------------------------------------------------------
 
 STATS = ("mean", "median", "p90", "max")
-
-
-def _noise_stats(survey: Survey, f: np.ndarray, filt: lk.MeasurementFilter,
-                 block: Optional[float]) -> Dict[str, Dict[str, np.ndarray]]:
-    """Predicted reading noise per channel: whole record ('mean') and over time blocks."""
-    out = {}
-    blocks = survey.block_spectra(block) if block else {}
-    for n, s in survey.spectra.items():
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            full = nz.predicted_noise(s, f, filt)
-            B = np.array([nz.predicted_noise(b, f, filt) for b in blocks.get(n, [])])
-        st = {"mean": full}
-        if len(B) >= 3:
-            st.update(p10=np.nanpercentile(B, 10, axis=0), median=np.nanmedian(B, axis=0),
-                      p90=np.nanpercentile(B, 90, axis=0), max=np.nanmax(B, axis=0))
-        else:
-            st.update(p10=full, median=full, p90=full, max=full)
-        st["spread"] = st["max"] / st["median"]
-        out[n] = st
-    return out
 
 
 def _filter(tau, slope, sync, dwell, advanced, window) -> lk.MeasurementFilter:
@@ -291,22 +174,89 @@ def _filter(tau, slope, sync, dwell, advanced, window) -> lk.MeasurementFilter:
                                 advanced=advanced, window=window)
 
 
+def _reading_noise(survey: Survey, names: Sequence[str], f: np.ndarray, filt: lk.MeasurementFilter,
+                   block: Optional[float]) -> Dict[str, Tuple[np.ndarray, Dict[int, np.ndarray]]]:
+    """Predicted noise of one reading per channel: (whole record, {block number: per block})."""
+    blocks = survey.block_spectra(block) if block else {}
+    out = {}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for n in names:
+            full = nz.predicted_noise(survey.spectra[n], f, filt)
+            per = {b.meta["block"]: nz.predicted_noise(b, f, filt) for b in blocks.get(n, [])}
+            out[n] = (full, per)
+    return out
+
+
+def _stats(full: np.ndarray, B: np.ndarray) -> Dict[str, np.ndarray]:
+    st = {"mean": full}
+    if len(B) >= 3:
+        st.update(p10=np.nanpercentile(B, 10, axis=0), median=np.nanmedian(B, axis=0),
+                  p90=np.nanpercentile(B, 90, axis=0), max=np.nanmax(B, axis=0))
+    else:
+        st.update(p10=full, median=full, p90=full, max=full)
+    st["spread"] = st["max"] / st["median"]
+    return st
+
+
+def _resistance_noise(survey: Survey, f: np.ndarray, filt: lk.MeasurementFilter,
+                      block: Optional[float], resistances: Mapping[str, float],
+                      excitation: float) -> Dict[str, Dict[str, np.ndarray]]:
+    """sigma_R (Ohm) per voltage channel: whole record ('mean') and statistics over blocks."""
+    cur = survey.current
+    for n in resistances:
+        if n not in survey.spectra or n == cur:
+            raise ValueError(f"resistances: {n!r} is not a voltage channel of this survey "
+                             f"({[m for m in survey.spectra if m != cur]})")
+    if not excitation or excitation <= 0:
+        raise ValueError("excitation: the excitation current in A (e.g. 2e-9)")
+    pred = _reading_noise(survey, [cur] + list(resistances), f, filt, block)
+    full_i, per_i = pred[cur]
+    out = {}
+    for n, R in resistances.items():
+        full_v, per_v = pred[n]
+
+        def sig(v, i, R=abs(R)):
+            return np.sqrt(v ** 2 + (R * i) ** 2) / excitation
+
+        common = sorted(set(per_v) & set(per_i))
+        B = np.array([sig(per_v[k], per_i[k]) for k in common]) if common else np.empty((0, len(f)))
+        out[n] = _stats(sig(full_v, full_i), B)
+    return out
+
+
+def _check_args(stat: str, resistances: Mapping[str, float]) -> Dict[str, float]:
+    if stat not in STATS:
+        raise ValueError(f"stat must be one of {STATS}")
+    if not resistances:
+        raise ValueError("resistances: {'SR860_B': R in Ohm, ...} for the voltage channels to rank by")
+    return {n: float(R) for n, R in resistances.items()}
+
+
+# --------------------------------------------------------------------------
+# Choosing frequencies
+# --------------------------------------------------------------------------
+
 @dataclass
 class Ranking:
     f: np.ndarray
-    noise: Dict[str, Dict[str, np.ndarray]]
-    score: np.ndarray
+    noise: Dict[str, Dict[str, np.ndarray]]   # sigma_R (Ohm) per channel and statistic
+    resistances: Dict[str, float]
+    excitation: float
+    current: str
+    score: np.ndarray                         # worst sigma_R / R over the channels
     excluded: np.ndarray
     best: List[Dict[str, Any]]
     filter: lk.MeasurementFilter
     stat: str
     block: Optional[float]
-    units: Dict[str, str]
     fmin: float = 0.0
     fmax: float = 0.0
+    run_id: Optional[int] = None
 
     @property
     def frequencies(self) -> List[float]:
+        """The picks (Hz), rounded to 0.1 mHz (4 decimals)."""
         return [b["f"] for b in self.best]
 
     def plot(self):
@@ -322,51 +272,60 @@ class Ranking:
     def __repr__(self) -> str:
         names = list(self.noise)
         how = f"{self.stat} over {self.block:g} s blocks" if self.block else self.stat
-        L = [f"Best frequencies {self.fmin:g}-{self.fmax:g} Hz for {self.filter.describe()}, "
-             f"ranked by {how}",
-             "  noise = predicted rms of one reading (input referred)"]
+        src = f" (survey run {self.run_id})" if self.run_id is not None else ""
+        L = [f"Best frequencies {hz(self.fmin)}-{hz(self.fmax)} Hz{src} for {self.filter.describe()}; "
+             f"ranked by the worst δR/R ({how})",
+             f"  δR = predicted rms noise of one data point of R = V/I, for I = "
+             f"{eng(self.excitation, 'A')} ({self.current}) and R = "
+             + ", ".join(f"{eng(R, 'Ω')} ({n})" for n, R in self.resistances.items())]
         if self.block:
             L.append(f"  spread = worst block / typical block; steady noise gives about "
-                     f"{self.typical_spread:.2f} here, clearly more = intermittent noise")
-        head = f"{'#':>3} {'f (Hz)':>8}"
+                     f"{self.typical_spread:.2f} here, clearly more = noise that comes and goes")
+        head = f"{'#':>3} {'f (Hz)':>9}"
         for n in names:
-            head += f" | {n + ' noise':>15} {'spread':>6}"
+            head += f" | {n + ' δR':>13} {'δR/R':>8} {'spread':>6}"
         L.append(head)
         for j, b in enumerate(self.best, start=1):
-            row = f"{j:>3} {b['f']:8.2f}"
+            row = f"{j:>3} {b['f']:9.4f}"
             for n in names:
-                row += f" | {eng(b[n], self.units[n]):>15} {b[n + '_spread']:>6.2f}"
+                row += f" | {eng(b[n], 'Ω'):>13} {pct(b[n + '_rel']):>8} {b[n + '_spread']:>6.2f}"
             L.append(row)
+        L.append("frequencies = [" + ", ".join(f"{b['f']:.4f}" for b in self.best) + "]   # Hz")
         return "\n".join(L)
 
 
-def best_frequencies(survey: Survey, fmin: float, fmax: float, *, tau: float = 0.3,
-                     slope: int = 24, advanced: bool = False, sync: bool = False,
-                     dwell: Optional[float] = None, window: str = "boxcar", n: int = 5, min_spacing: float = 1.0, avoid_mains: bool = True,
+def best_frequencies(survey: Survey, resistances: Mapping[str, float], excitation: float, *,
+                     fmin: Optional[float] = None, fmax: Optional[float] = None,
+                     tau: float = 0.3, slope: int = 24, advanced: bool = False,
+                     sync: bool = False, dwell: Optional[float] = None, window: str = "boxcar",
+                     n: int = 5, min_spacing: float = 1.0, avoid_mains: bool = True,
                      block: Optional[float] = 60.0, stat: str = "p90") -> Ranking:
-    """Step 2: the quietest reference frequencies in [fmin, fmax] for the given lock-in settings.
+    """The reference frequencies in [fmin, fmax] with the lowest resistance noise.
 
+    resistances : {voltage lock-in: typical |R| in Ohm}, e.g. {'SR860_B': 106, 'SR860_C': 16};
+                  ranked by the worst δR/R among them
+    excitation  : excitation current (A), e.g. SR860_A's reading with the excitation on
+    fmin, fmax  : range to search (Hz); default: the survey's band
     tau, slope, sync : lock-in time constant (s), slope (dB/oct) and sync filter you will use
-    advanced         : SR860 Advanced filter on (Gaussian stages for tau <= 3 s)
-    dwell            : extra software averaging per data point (s); None = one reading
-    window           : weighting within the dwell: 'boxcar' (plain mean) or 'hann'
-    n, min_spacing   : how many to return and how far apart (Hz)
-    avoid_mains      : skip mains * p/q, q <= 4 (15, 20, 30, 40, 45 ... Hz for 60 Hz)
-    block            : time-block length (s) for the time-variation analysis; None = off
-    stat             : rank by 'mean' (whole record), 'median', 'p90' (exceeded 10 % of
-                       the time) or 'max' over blocks
-    Channels are combined with a geometric mean of noise / median-over-range, since
-    they share one reference.
+    advanced    : SR860 Advanced filter on (Gaussian stages for tau <= 3 s)
+    dwell       : extra software averaging per data point (s); None = one reading
+    window      : weighting within the dwell: 'boxcar' (plain mean) or 'hann'
+    n, min_spacing : how many to return and how far apart (Hz)
+    avoid_mains : skip mains * p/q, q <= 4 (15, 20, 30, 40, 45 ... Hz for 60 Hz)
+    block       : time-block length (s) for noise that comes and goes; None = off
+    stat        : rank by 'mean' (whole record), 'median', 'p90' (exceeded 10 % of the
+                  time) or 'max' over blocks
+    Frequencies are rounded to 0.1 mHz and printed with all 4 decimals.
     """
-    if stat not in STATS:
-        raise ValueError(f"stat must be one of {STATS}")
+    resistances = _check_args(stat, resistances)
+    fmin = survey.settings["fmin"] if fmin is None else fmin
+    fmax = survey.settings["fmax"] if fmax is None else fmax
     filt = _filter(tau, slope, sync, dwell, advanced, window)
     step = min(s.df for s in survey.spectra.values())
-    f = np.arange(fmin, fmax + step / 2, step)
+    f = np.round(np.arange(fmin, fmax + step / 2, step), 4)
     f = f[f <= fmax + 1e-9]
-    stats = _noise_stats(survey, f, filt, block)
-    rel = [np.log(st[stat] / np.nanmedian(st[stat])) for st in stats.values()]
-    score = np.exp(np.mean(rel, axis=0))
+    stats = _resistance_noise(survey, f, filt, block, resistances, excitation)
+    score = np.max([stats[c][stat] / abs(R) for c, R in resistances.items()], axis=0)
     tol = max(0.5, 3 * filt.enbw(float(np.mean([fmin, fmax]))))
     excluded = nz.mains_related(f, survey.mains, 4, tol) if avoid_mains else np.zeros(f.shape, bool)
 
@@ -377,49 +336,52 @@ def best_frequencies(survey: Survey, fmin: float, fmax: float, *, tau: float = 0
         if any(abs(f[i] - b["f"]) < min_spacing for b in best):
             continue
         row: Dict[str, Any] = {"f": float(f[i]), "score": float(score[i])}
-        for name, st in stats.items():
-            row[name] = float(st[stat][i])
-            row[name + "_spread"] = float(st["spread"][i])
+        for c, R in resistances.items():
+            row[c] = float(stats[c][stat][i])
+            row[c + "_rel"] = float(stats[c][stat][i] / abs(R))
+            row[c + "_spread"] = float(stats[c]["spread"][i])
         best.append(row)
         if len(best) >= n:
             break
-    units = {name: s.unit for name, s in survey.spectra.items()}
-    ranking = Ranking(f, stats, score, excluded, best, filt, stat, block, units, fmin, fmax)
+    ranking = Ranking(f, stats, resistances, float(excitation), survey.current, score, excluded,
+                      best, filt, stat, block, fmin, fmax, survey.run_id)
     print(ranking)
     return ranking
 
 
-def expected_noise(survey: Survey, frequencies, *, tau: float = 0.3, slope: int = 24,
+def expected_noise(survey: Survey, frequencies, resistances: Mapping[str, float],
+                   excitation: float, *, tau: float = 0.3, slope: int = 24,
                    advanced: bool = False, sync: bool = False, dwell: Optional[float] = None,
                    window: str = "boxcar", block: Optional[float] = 60.0) -> List[Dict[str, Any]]:
-    """Predicted noise of one reading at the given frequencies, for the given lock-in settings.
+    """Predicted resistance noise of one data point at the given frequencies (Hz).
 
-    Prints, per channel: the whole-record value, the 90th percentile and the worst
-    `block`-second block. Returns the rows.
+    Same arguments as best_frequencies. Prints, per voltage channel: δR over the whole record,
+    its 90th percentile and worst value over `block`-second blocks, and the 90th percentile
+    relative to R. Returns the rows.
     """
+    resistances = _check_args("p90", resistances)
     fr = np.atleast_1d(np.asarray(frequencies, dtype=float))
     filt = _filter(tau, slope, sync, dwell, advanced, window)
-    stats = _noise_stats(survey, fr, filt, block)
-    names = list(stats)
-    units = {n: s.unit for n, s in survey.spectra.items()}
+    stats = _resistance_noise(survey, fr, filt, block, resistances, excitation)
     rows = []
     for i, f in enumerate(fr):
         row: Dict[str, Any] = {"f": float(f)}
-        for n in names:
+        for n, R in resistances.items():
             for k in ("mean", "p90", "max"):
                 row[f"{n}_{k}"] = float(stats[n][k][i])
+            row[f"{n}_rel_p90"] = float(stats[n]["p90"][i] / abs(R))
         rows.append(row)
     how = f"; p90 and worst over {block:g} s blocks" if block else ""
-    print(f"Expected noise for {filt.describe()} (rms of one reading, input referred{how})")
-    head = f"{'f (Hz)':>9}"
-    for n in names:
-        head += f" | {n + ' mean':>14} {'p90':>9} {'worst':>9}"
+    print(f"Expected noise of one data point of R = V/I for {filt.describe()}, I = "
+          f"{eng(excitation, 'A')} ({survey.current}){how}")
+    head = f"{'f (Hz)':>12}"
+    for n in resistances:
+        head += f" | {n + ' δR':>13} {'p90':>9} {'worst':>9} {'p90/R':>8}"
     print(head)
     for r in rows:
-        line = f"{r['f']:9.3f}"
-        for n in names:
-            u = units[n]
-            line += (f" | {eng(r[n + '_mean'], u):>14} {eng(r[n + '_p90'], u):>9} "
-                     f"{eng(r[n + '_max'], u):>9}")
+        line = f"{hz(r['f']):>12}"
+        for n in resistances:
+            line += (f" | {eng(r[n + '_mean'], 'Ω'):>13} {eng(r[n + '_p90'], 'Ω'):>9} "
+                     f"{eng(r[n + '_max'], 'Ω'):>9} {pct(r[n + '_rel_p90']):>8}")
         print(line)
     return rows

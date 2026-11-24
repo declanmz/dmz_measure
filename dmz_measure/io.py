@@ -1,28 +1,20 @@
-"""Run storage in measureme's folder layout.
+"""The data folder, and loading runs for analysis.
 
-Each run gets the lowest free integer folder in ``basedir`` (the same scheme as
-measureme's ``db.Writer``, included in dmz_measure.measureme), so all runs share one ID
-sequence in the data folder. Every run folder contains
-
-* ``metadata.json``  with at least ``type``, ``interrupted``, ``start_time``,
-  ``end_time``, ``columns``, ``comments`` (so ``dm.list_measurements`` lists it)
-* ``data.tsv.gz``    a small numeric table (np.loadtxt-able), e.g. the spectra
-* optional ``*.npz`` arrays (time series) and ``*.png`` figures
+Runs are measureme's numbered folders in the data folder (``metadata.json``, ``data.tsv.gz``
+and, for streamed runs, ``stream.npz``), written by the stations.
 """
 from __future__ import annotations
 
-import gzip
 import json
 import os
-import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, Optional
 
 import numpy as np
 
 
 def set_basedir(path: str) -> None:
-    """Data folder for all runs (stations and the survey/check tools): dm.set_basedir."""
+    """Data folder for all runs: dm.set_basedir (measureme's set_basedir)."""
     from .measureme import sweep as _mm
 
     _mm.set_basedir(path)
@@ -40,100 +32,6 @@ def get_basedir(basedir: Optional[str] = None, required: bool = True) -> Optiona
     return os.path.expanduser(path)
 
 
-def _json_default(o: Any):
-    if isinstance(o, (np.integer,)):
-        return int(o)
-    if isinstance(o, (np.floating,)):
-        return float(o)
-    if isinstance(o, (np.bool_,)):
-        return bool(o)
-    if isinstance(o, np.ndarray):
-        return o.tolist()
-    if isinstance(o, complex):
-        return [o.real, o.imag]
-    if hasattr(o, "__dict__"):
-        return {k: v for k, v in vars(o).items() if not k.startswith("_")}
-    return str(o)
-
-
-class RunWriter:
-    """Create the next numbered run folder and write into it.
-
-    >>> with RunWriter(basedir, 'noise_survey', comment='ID 44: survey') as w:
-    ...     w.metadata['f_ref'] = 100
-    ...     w.write_table(['f_Hz', 'asd'], np.c_[f, asd])
-    """
-
-    def __init__(self, basedir: Optional[str], kind: str, comment: str = "",
-                 measurement_config: Optional[Dict[str, Any]] = None, max_id: int = 1_000_000):
-        base = get_basedir(basedir)
-        os.makedirs(base, exist_ok=True)
-        i = 0
-        while True:
-            try:
-                os.mkdir(os.path.join(base, str(i)))
-                break
-            except FileExistsError:
-                i += 1
-                if i > max_id:
-                    raise RuntimeError("could not pick a run id")
-        self.id = i
-        self.dir = os.path.join(base, str(i))
-        self.metadata: Dict[str, Any] = {
-            "type": kind,
-            "comments": [comment] if comment else [],
-            "interrupted": False,
-            "start_time": time.time(),
-            "columns": [],
-            "library": "dmz_measure",
-        }
-        if measurement_config:
-            self.metadata["measurement_config"] = dict(measurement_config)
-        self._table_written = False
-        self.write_metadata()
-
-    def __enter__(self) -> "RunWriter":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.close(interrupted=exc_type is not None)
-
-    def path(self, name: str) -> str:
-        return os.path.join(self.dir, name)
-
-    def write_metadata(self) -> None:
-        with open(self.path("metadata.json"), "wt") as f:
-            json.dump(self.metadata, f, indent=4, default=_json_default)
-
-    def write_table(self, columns: Sequence[str], data: np.ndarray, fmt: str = "%.9g") -> None:
-        data = np.atleast_2d(np.asarray(data, dtype=float))
-        if data.shape[1] != len(columns):
-            raise ValueError(f"{len(columns)} columns but data has {data.shape[1]}")
-        with gzip.open(self.path("data.tsv.gz"), "wt") as f:
-            np.savetxt(f, data, delimiter="\t", fmt=fmt)
-        self.metadata["columns"] = list(columns)
-        self._table_written = True
-
-    def save_arrays(self, name: str, **arrays: np.ndarray) -> str:
-        p = self.path(name if name.endswith(".npz") else name + ".npz")
-        np.savez(p, **arrays)
-        return p
-
-    def save_figure(self, fig, name: str = "plot.png", dpi: int = 120) -> str:
-        p = self.path(name)
-        fig.savefig(p, dpi=dpi, bbox_inches="tight")
-        return p
-
-    def close(self, interrupted: bool = False) -> None:
-        if not self._table_written:
-            # sweep's Reader expects data.tsv.gz to exist
-            with gzip.open(self.path("data.tsv.gz"), "wt"):
-                pass
-        self.metadata["interrupted"] = bool(interrupted)
-        self.metadata["end_time"] = time.time()
-        self.write_metadata()
-
-
 @dataclass
 class Run:
     id: int
@@ -148,6 +46,7 @@ class Run:
 
 
 def load_run(run_id: int, basedir: Optional[str] = None) -> Run:
+    """A run's metadata and its data table as {column: array}."""
     d = os.path.join(get_basedir(basedir), str(run_id))
     with open(os.path.join(d, "metadata.json")) as f:
         md = json.load(f)

@@ -43,7 +43,7 @@ STYLE = {
     "font.size": 10,
 }
 
-_PREFIX = [(1e-15, "f"), (1e-12, "p"), (1e-9, "n"), (1e-6, "µ"), (1e-3, "m"), (1.0, "")]
+_PREFIX = [(1e-15, "f"), (1e-12, "p"), (1e-9, "n"), (1e-6, "µ"), (1e-3, "m"), (1.0, ""), (1e3, "k"), (1e6, "M")]
 
 
 def eng(x: float, unit: str = "", digits: int = 3) -> str:
@@ -54,6 +54,16 @@ def eng(x: float, unit: str = "", digits: int = 3) -> str:
         if abs(x) >= scale:
             return f"{x / scale:.{digits}g} {p}{unit}".strip()
     return f"{x / 1e-15:.{digits}g} f{unit}".strip()
+
+
+def hz(f: float) -> str:
+    """A frequency with all its digits (up to 6 decimals, trailing zeros dropped): '13.2943'."""
+    return f"{f:.6f}".rstrip("0").rstrip(".")
+
+
+def pct(x: float) -> str:
+    """A ratio as a percentage with 3 significant digits: pct(0.01234) -> '1.23%'."""
+    return f"{100 * x:.3g}%" if np.isfinite(x) else "-"
 
 
 def _spectra_and_lines(obj) -> tuple:
@@ -104,7 +114,7 @@ def plot_survey(survey: Any, fmin: Optional[float] = None, fmax: Optional[float]
 
 
 def plot_ranking(rank: Any, figsize: Optional[tuple] = None):
-    """Predicted noise of one reading vs reference frequency, one panel per channel.
+    """Predicted δR/R of one data point vs reference frequency, one panel per voltage channel.
 
     Line: the statistic used for ranking. Band: 10-90 % of the time blocks (wide band =
     noise that comes and goes). Grey: mains-related, skipped. Triangles: the picks.
@@ -115,7 +125,8 @@ def plot_ranking(rank: Any, figsize: Optional[tuple] = None):
         fig, axes = plt.subplots(n, 1, sharex=True, figsize=figsize or (10, 2.4 * n + 0.6),
                                  squeeze=False)
         for i, (ax, name) in enumerate(zip(axes[:, 0], names)):
-            st = rank.noise[name]
+            R = abs(rank.resistances[name])
+            st = {k: 100 * v / R for k, v in rank.noise[name].items() if k != "spread"}
             col = SERIES[i % len(SERIES)]
             _shade(ax, rank.f, rank.excluded)
             if rank.block:
@@ -123,13 +134,13 @@ def plot_ranking(rank: Any, figsize: Optional[tuple] = None):
                 if rank.stat != "median":
                     ax.plot(rank.f, st["median"], color=col, lw=0.8, alpha=0.7, zorder=2)
             ax.semilogy(rank.f, st[rank.stat], color=col, lw=1.5, zorder=2)
-            tr = ax.get_xaxis_transform()
             for j, b in enumerate(rank.best, start=1):
-                ax.plot(b["f"], b[name], "^", ms=7, color=INK, mec=SURFACE, mew=0.8, zorder=4)
-                ax.annotate(str(j), (b["f"], b[name]), xytext=(0, -13), textcoords="offset points",
+                y = 100 * b[name + "_rel"]
+                ax.plot(b["f"], y, "^", ms=7, color=INK, mec=SURFACE, mew=0.8, zorder=4)
+                ax.annotate(str(j), (b["f"], y), xytext=(0, -13), textcoords="offset points",
                             ha="center", fontsize=8, color=INK)
-            ax.set_title(name, pad=4)
-            ax.set_ylabel(rank.units[name] + " rms")
+            ax.set_title(f"{name}   R = {eng(R, 'Ω')}, I = {eng(rank.excitation, 'A')}", pad=4)
+            ax.set_ylabel("δR/R (%)")
         how = (f"thick: {rank.stat}   thin: median   band: 10-90 % of {rank.block:g} s blocks"
                if rank.block else f"line: {rank.stat}")
         axes[0, 0].text(1.0, 1.02, f"{rank.filter.describe()}   {how}   ▲ picks   grey: mains-related",
@@ -173,23 +184,45 @@ def plot_spectrogram(t: np.ndarray, f: np.ndarray, psd: np.ndarray, name: str = 
 
 
 def plot_check(check: Any, figsize: Optional[tuple] = None):
-    """Allan deviation of X per channel (one panel each), one line per candidate frequency.
+    """Allan deviation of R = V/I (I for the current channel) relative to its value, one panel
+    per channel, one line per frequency.
 
     Falling like 1/sqrt(time) = averaging still helps; flattening or rising = drift.
     """
-    freqs = list(check.allan)
-    names = list(check.allan[freqs[0]]) if freqs else []
+    names = check.names
     n = len(names)
     with plt.rc_context(STYLE):
         fig, axes = plt.subplots(1, n, figsize=figsize or (4.2 * n + 0.5, 3.6), squeeze=False)
         for ax, name in zip(axes[0], names):
-            for i, f in enumerate(freqs):
-                t, a = check.allan[f][name]
-                ax.loglog(t, a, color=SERIES[i % len(SERIES)], lw=1.5, label=f"{f:.2f} Hz")
-            ax.set_title(name, pad=4)
+            for i, (row, al) in enumerate(zip(check.rows, check.allan)):
+                if name in al:
+                    t, a = al[name]
+                    ax.loglog(t, a, color=SERIES[i % len(SERIES)], lw=1.5, label=f"{hz(row['f'])} Hz")
+            ax.set_title(f"{name} {check.quantity(name)[0]}", pad=4)
             ax.set_xlabel("averaging time (s)")
-        axes[0, 0].set_ylabel("Allan deviation of X (input units)")
+        axes[0, 0].set_ylabel("Allan deviation / value")
         axes[0, -1].legend(loc="best")
+        fig.tight_layout()
+    return fig
+
+
+def plot_check_traces(check: Any, figsize: Optional[tuple] = None):
+    """R = V/I (I for the current channel) vs time at each frequency, one point per dwell."""
+    names = check.names
+    n = len(names)
+    with plt.rc_context(STYLE):
+        fig, axes = plt.subplots(n, 1, sharex=True, figsize=figsize or (10, 2.4 * n + 0.6),
+                                 squeeze=False)
+        for ax, name in zip(axes[:, 0], names):
+            q, u = check.quantity(name)
+            for i, (row, tr) in enumerate(zip(check.rows, check.traces)):
+                t, v = tr[name]
+                ax.plot(t, v, ".-", ms=3, lw=0.8, color=SERIES[i % len(SERIES)],
+                        label=f"{hz(row['f'])} Hz")
+            ax.set_title(f"{name}: {q}", pad=4)
+            ax.set_ylabel(f"{q} ({u})")
+        axes[0, 0].legend(loc="best", fontsize=8)
+        axes[-1, 0].set_xlabel(f"time (s), {check.dwell:g} s points")
         fig.tight_layout()
     return fig
 

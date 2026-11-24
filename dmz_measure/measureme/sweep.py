@@ -1,6 +1,7 @@
 # Part of dmz_measure. Copied from measureme (https://github.com/sharpelab/measureme,
 # commit 2fab7a4, authors spxtr and Aaron Sharpe), GPL-3.0; see LICENSE.
-# Modified: imports are relative to this package.
+# Modified: imports are relative to this package; _interruptible restores the interrupt
+# handler also when the measurement raises.
 import dataclasses
 import functools
 import os
@@ -145,9 +146,12 @@ def _interruptible(func):
         def handler(signum, frame):
             args[0].interrupt_requested = True
         old_handler = signal.signal(signal.SIGINT, handler)
-        result = func(*args, **kwargs)
-        signal.signal(signal.SIGINT, old_handler)
-        return result
+        try:
+            return func(*args, **kwargs)
+        finally:
+            # dmz_measure: restore the handler even when func raises (e.g. a VISA timeout),
+            # so the interrupt button keeps working afterwards
+            signal.signal(signal.SIGINT, old_handler)
     return wrapper
 
 
