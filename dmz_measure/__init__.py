@@ -24,6 +24,8 @@ Analysis (from the run ID, no instruments):
     survey = dm.load_survey(run_id, current='SR860_A')
     best = dm.best_frequencies(survey, resistances={'SR860_B': 106}, excitation=2e-9, tau=0.3)
     check = dm.load_check(run_id, current='SR860_A')
+    up, down = dm.load_updown(run_id)               # map swept up then down on every line
+    b = dm.bin_map(up, fast=2, slow=2)
 
 The excitation amplitude is never changed by this package.
 """
@@ -32,6 +34,7 @@ from .check import Check, load_check
 from .instruments.sr860 import LockinIO, apply_settings, preserved_settings
 from .instruments.sr860_stream import SR860Stream, StreamData, StreamTimeout, acquire_many
 from .io import get_basedir, load_run, set_basedir
+from .maps import bin_map, load_updown
 from .measureme import db, raster
 from .measureme.sweep import list_measurements, measurement_info
 from .measureme.sweep_load import load, load_meta, pload, pload0d, pload1d, pload2d
@@ -40,4 +43,4 @@ from .station import AsyncStation, Station
 from .survey import Ranking, Survey, best_frequencies, expected_noise, load_survey
 from .sweeps import compare, point_noise, refilter
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"

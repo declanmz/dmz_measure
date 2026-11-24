@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 # measureme (`sweep`): both can be installed side by side.
 [project]
 name = "dmz_measure"
-version = "0.7.0"
+version = "0.7.1"
 description = "measureme + SR860 streaming, noise surveys and streamed gate sweeps"
 readme = "README.md"
 license = {text = "GPL-3.0-or-later"}

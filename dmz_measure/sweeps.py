@@ -8,12 +8,17 @@ samples are averaged (Hann-weighted or plain). Samples are tied to host time thr
 arrival time of the first packet (the stream itself has no timestamps), good to ~1 ms.
 
 The raw stream of every line is kept (decimated to >= 16 f_ref) in the run's
-``stream.npz``, so :func:`refilter` can redo the averaging with other settings.
+``stream.npz`` (a sweep) or ``stream_00000.npz``, ``stream_00001.npz``, ... (a map: one file
+per line, written when the line ends), so :func:`refilter` can redo the averaging with other
+settings, also while a map is still running.
 """
 from __future__ import annotations
 
+import glob
 import io as _io
+import os
 import time
+import zipfile
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
@@ -219,6 +224,22 @@ def _npz_to_segments(path: str, names: Sequence[str]) -> List[Dict[str, Any]]:
     return segs
 
 
+def load_segments(run_dir: str, names: Sequence[str]) -> List[Dict[str, Any]]:
+    """The saved stream of a run, one segment per line: ``stream.npz`` (sweeps, and maps saved
+    by dmz_measure 0.7.0), or the per-line files ``stream_00000.npz``, ... of a map. A line
+    file that can't be read yet (still being written or synced) is skipped."""
+    one = os.path.join(run_dir, "stream.npz")
+    if os.path.exists(one):
+        return _npz_to_segments(one, names)
+    segs: List[Dict[str, Any]] = []
+    for path in sorted(glob.glob(os.path.join(run_dir, "stream_[0-9]*.npz"))):
+        try:
+            segs.extend(_npz_to_segments(path, names))
+        except (OSError, ValueError, EOFError, KeyError, zipfile.BadZipFile):
+            continue
+    return segs
+
+
 # --------------------------------------------------------------------------
 # re-averaging saved runs
 # --------------------------------------------------------------------------
@@ -251,7 +272,7 @@ def refilter(run_id: int, dwell: Optional[float] = None, settle: Optional[float]
     cols = {c: v for c, v in st["columns"].items()}
     names = sorted({v[0] for v in cols.values()})
     table = {k: v.copy() for k, v in run.table.items()}
-    for seg in _npz_to_segments(f"{run.dir}/stream.npz", names):
+    for seg in load_segments(run.dir, names):
         a = seg["t_set1"] + settle
         b = np.minimum(a + dwell, np.append(seg["t_set0"][1:], np.inf))
         for i, row in enumerate(seg["rows"]):
@@ -262,14 +283,15 @@ def refilter(run_id: int, dwell: Optional[float] = None, settle: Optional[float]
                 jb = min(int(np.floor((b[i] - s["t_first"]) * s["fs"])), len(zz))
                 vals[n] = weighted_mean(zz[ja:jb], window)
             for c, (n, comp, gain) in cols.items():
-                if n in vals and c in table:
+                if n in vals and c in table and row < len(table[c]):   # (a running map's rows may lag)
                     table[c][row] = component(vals[n], comp) / gain
     out: Dict[str, Any] = {"measurement_config": md.get("measurement_config"),
                            "settings": dict(st, settle=settle, dwell=dwell, window=window)}
     if md["type"] == "2D":
         xs, ys = np.array(md["fast_setpoints"]), np.array(md["slow_setpoints"])
         out.update(xs=xs, ys=ys)
-        for c, v in table.items():
+        for c in md.get("columns", []):                  # points not measured (yet) are NaN
+            v = np.asarray(table.get(c, np.empty(0)), dtype=float)[: len(xs) * len(ys)]
             v = np.pad(v, (0, len(xs) * len(ys) - len(v)), constant_values=np.nan)
             out[c] = v.reshape(len(ys), len(xs))
     else:

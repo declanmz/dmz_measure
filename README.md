@@ -13,6 +13,12 @@ On top of measureme, dmz_measure adds SR860 data streaming:
 * **Streamed sweeps.** `s.stream_sweep` and `s.stream_megasweep` work like `s.sweep` and
   `s.megasweep`, but each point is averaged from the lock-in's data stream. Points don't
   blur into each other, and the saved stream can be re-averaged later.
+* **Up/down gate maps.** A megasweep whose fast axis goes up and straight back down on every
+  line (`np.r_[V, V[::-1]]`) measures both sweep directions in one run, with no ramp back
+  between lines. `dm.load_updown` splits it into the up and the down map on the same grid, and
+  `dm.bin_map` averages blocks of points. A streamed map writes each line's stream when the line
+  ends, so it can be loaded (and re-averaged) while it is still running, e.g. from another
+  computer through a synced folder.
 * **Choosing an excitation frequency.** `s.noise_survey` records the noise of the lock-in
   inputs (excitation off), `dm.best_frequencies` ranks frequencies by the expected noise of
   the resistance, including noise that comes and goes, and `s.check_frequencies` measures the
@@ -69,6 +75,8 @@ d = dm.refilter(13, dwell=0.1)                           # re-average a streamed
 survey = dm.load_survey(14, current='SR860_A')
 best = dm.best_frequencies(survey, {'SR860_B': 106}, excitation=2e-9, tau=0.3)
 check = dm.load_check(15, current='SR860_A', dwell=0.6)
+up, down = dm.load_updown(16)                            # map swept up then down on every line
+b = dm.bin_map(up, fast=2, slow=2)                       # mean of 2 x 2 blocks
 ```
 
 Every function's docstring lists its options.

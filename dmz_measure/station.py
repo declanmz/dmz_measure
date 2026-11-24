@@ -89,7 +89,11 @@ class _Streaming:
         if hasattr(self, "_ps_by_inst"):
             groups: Dict[Any, List[int]] = {}
             for i in idx:
-                groups.setdefault(getattr(plan[i][1], "instrument", i), []).append(i)
+                p = plan[i][1]
+                inst = getattr(p, "instrument", None)
+                if inst is None:   # a DelegateParameter (e.g. a retry wrapper): its source's instrument
+                    inst = getattr(getattr(p, "source", None), "instrument", None)
+                groups.setdefault(inst if inst is not None else i, []).append(i)
             groups_l = list(groups.values())
         else:
             groups_l = [idx]
@@ -335,6 +339,15 @@ class _Streaming:
                 cols[name] = [a, comp, gain]
         w.metadata["stream"] = dict(setup.describe(settle, dwell, window), columns=cols)
 
+    def _save_line_stream(self, w, i: int, seg) -> None:
+        """Write line i's stream now, as its own file: stream_00000.npz, stream_00001.npz, ...
+        If it can't be written the map goes on (its points are in the data file) with a warning."""
+        try:
+            w.add_blob(f"stream_{i:05d}.npz", segments_to_npz([seg]))
+        except OSError as e:
+            self.logger.warning(f"could not save the stream of line {i} ({e}); "
+                                "its points are saved, but it can't be re-averaged")
+
     def _stream_line(self, w, p, live_args, plan, prefix, param, setpoints, settle, dwell, window,
                      row0: int, f_ref: float, desc_kw: Dict[str, Any]):
         """One line: start streams, step `param` through `setpoints`, average, stop.
@@ -425,10 +438,14 @@ class _Streaming:
                          advanced: Optional[bool] = None, sync: bool = True,
                          rate: Optional[float] = None) -> SweepResult:
         """Like ``megasweep(slow_param, slow_v, fast_param, fast_v, slow_delay, fast_delay)``,
-        with each fast line streamed (see stream_sweep for dwell / settle / window / filter)."""
+        with each fast line streamed (see stream_sweep for dwell / settle / window / filter).
+
+        Each line's stream is written to the run folder as soon as the line ends
+        (stream_00000.npz, stream_00001.npz, ...): nothing piles up in memory, and a map that
+        is still running can be re-averaged (dm.refilter, dm.load_updown) from another computer.
+        """
         self._check_interrupted()
         ios, plan = self._stream_plan()
-        segments = []
         with _db.Writer(self._basedir) as w, self._plotter as p:
             self.logger.info(f"Starting stream_megasweep with ID {w.id}")
             self._begin(w, "stream_megasweep", ["time", slow_param.full_name, fast_param.full_name],
@@ -457,11 +474,10 @@ class _Streaming:
                     seg, n, interrupted = self._stream_line(
                         w, p, (ios, setup.rate), plan, [ov], fast_param, fast_v, settle_s, dwell,
                         window, n_done, setup.f, dict(position=1, leave=False))
-                    segments.append(seg)
+                    self._save_line_stream(w, i, seg)
                     n_done += n
                     if interrupted:
                         break
-            w.add_blob("stream.npz", segments_to_npz(segments))
             self._end(w, p, interrupted)
         self._log_done(w)
         return SweepResult(self._basedir, w.id, w.metadata, w.datapath)

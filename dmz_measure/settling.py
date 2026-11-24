@@ -117,14 +117,14 @@ def step_response_from_run(run_id: int, tol: float = 0.01, basedir: Optional[str
     dm.refilter(run_id, settle=...).
     """
     from .io import load_run
-    from .sweeps import _npz_to_segments
+    from .sweeps import load_segments
 
     run = load_run(run_id, basedir)
     st = run.metadata["stream"]
     names = sorted({v[0] for v in st["columns"].values()})
     collected: Dict[str, List] = {}
     set_times: List[float] = []
-    for seg in _npz_to_segments(f"{run.dir}/stream.npz", names):
+    for seg in load_segments(run.dir, names):
         t0, t1 = seg["t_set0"], seg["t_set1"]
         set_times += list(t1 - t0)
         windows = [(t0[i], t1[i],

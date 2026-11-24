@@ -1,7 +1,9 @@
 """The data folder, and loading runs for analysis.
 
 Runs are measureme's numbered folders in the data folder (``metadata.json``, ``data.tsv.gz``
-and, for streamed runs, ``stream.npz``), written by the stations.
+and, for streamed runs, ``stream.npz`` or, for streamed maps, one ``stream_00000.npz`` per
+line), written by the stations. While a run is still going its points are in ``data.tsv``
+(measureme compresses it at the end), so a run can be loaded while it is being measured.
 """
 from __future__ import annotations
 
@@ -45,15 +47,35 @@ class Run:
             return {k: z[k] for k in z.files}
 
 
+def _read_rows(d: str, n_cols: int) -> Optional[np.ndarray]:
+    """The data rows of a run: data.tsv.gz once it has ended, else data.tsv (still being
+    written, a row per point). Only complete lines of data.tsv are used: a last row cut off in
+    the middle of being written (or synced) is left out, never read as a shorter number."""
+    gz, plain = os.path.join(d, "data.tsv.gz"), os.path.join(d, "data.tsv")
+    if os.path.exists(gz) and os.path.getsize(gz) > 20:
+        try:
+            return np.loadtxt(gz, delimiter="\t", ndmin=2)
+        except (EOFError, OSError, ValueError):   # still being compressed: data.tsv is complete
+            pass
+    if not os.path.exists(plain):
+        return None
+    with open(plain, "rt", newline="") as f:
+        text = f.read()
+    lines = text.split("\n")[:-1]                  # the part after the last newline is unfinished
+    rows = [r.rstrip("\r").split("\t") for r in lines if r.strip()]
+    rows = [r for r in rows if len(r) == n_cols]
+    return np.array(rows, dtype=float).reshape(-1, n_cols) if rows else None
+
+
 def load_run(run_id: int, basedir: Optional[str] = None) -> Run:
-    """A run's metadata and its data table as {column: array}."""
+    """A run's metadata and its data table as {column: array}, also while it is running."""
     d = os.path.join(get_basedir(basedir), str(run_id))
     with open(os.path.join(d, "metadata.json")) as f:
         md = json.load(f)
     table: Dict[str, np.ndarray] = {}
-    p = os.path.join(d, "data.tsv.gz")
-    if os.path.exists(p) and os.path.getsize(p) > 20:
-        data = np.atleast_2d(np.loadtxt(p, delimiter="\t"))
-        for i, c in enumerate(md.get("columns", [])):
+    cols = md.get("columns", [])
+    data = _read_rows(d, len(cols)) if cols else None
+    if data is not None:
+        for i, c in enumerate(cols):
             table[c] = data[:, i]
     return Run(run_id, d, md, table)
