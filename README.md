@@ -1,7 +1,7 @@
 # dmz_measure
 
 **dmz_measure is built on [measureme](https://github.com/sharpelab/measureme)**, the
-measurement framework by spxtr, Aaron Sharpe and other contributors (originally
+measurement framework by Aaron Sharpe and other contributors (originally
 [spxtr/measureme](https://github.com/spxtr/measureme)). Its stations, sweeps, data files
 and loaders are measureme's own code, included here as `dmz_measure.measureme`. It was
 copied from sharpelab/measureme at commit `2fab7a4` under the GPL-3.0, with only two
@@ -18,8 +18,6 @@ On top of measureme, dmz_measure adds SR860 data streaming:
   frequencies you pick.
 * **Faster gate ramps.** `dm.fast_ramp` keeps the same voltage steps but doesn't wait for
   the Keithley to reply after each one.
-
-dmz_measure never changes the lock-in excitation amplitude.
 
 ## Install
 
