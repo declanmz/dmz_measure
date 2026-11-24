@@ -68,11 +68,15 @@ Every function's docstring lists its options.
 ## Firewall
 
 The SR860 streams UDP packets to the PC, so Windows Firewall has to let them in. In an
-administrator PowerShell, allow them from your instrument subnet only:
+administrator PowerShell, allow them from your instrument subnet only, replacing
+`<instrument subnet>` with yours (for example `192.168.1.0/24`):
 
 ```
-New-NetFirewallRule -DisplayName "SR860 streaming" -Direction Inbound -Protocol UDP -LocalPort 1865-1880 -RemoteAddress 192.168.50.0/24 -Action Allow
+New-NetFirewallRule -DisplayName "SR860 streaming" -Direction Inbound -Protocol UDP -LocalPort 1865-1880 -RemoteAddress <instrument subnet> -Action Allow
 ```
+
+If streaming times out, the error message prints this command with the lock-in's own
+subnet filled in.
 
 ## License
 

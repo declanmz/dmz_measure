@@ -48,7 +48,7 @@ Most likely causes:
 
 
 def _help(name: str, port: int, timeout: float, ip: Optional[str]) -> str:
-    subnet = ip.rsplit(".", 1)[0] + ".0/24" if ip else "<instrument subnet, e.g. 192.168.50.0/24>"
+    subnet = ip.rsplit(".", 1)[0] + ".0/24" if ip else "<instrument subnet, e.g. 192.168.1.0/24>"
     return FIREWALL_HELP.format(name=name, port=port, timeout=timeout, subnet=subnet)
 
 
