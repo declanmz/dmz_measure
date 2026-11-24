@@ -73,14 +73,21 @@ def test_fixed_tau_is_used(rig):
     assert ck.rows[0]["tau"] == pytest.approx(3e-3) and ck.rows[0]["sync"] is False
 
 
-def test_basedir_follows_sweep(tmp_path, monkeypatch):
-    import sys
-    import types
+def test_set_basedir_is_one_folder_for_everything(tmp_path, monkeypatch):
+    from dmz_measure.measureme import sweep as mm
 
-    fake_sweep = types.ModuleType("sweep.sweep")
-    fake_sweep.BASEDIR = str(tmp_path / "data")
-    monkeypatch.setitem(sys.modules, "sweep.sweep", fake_sweep)
-    assert dm.io.get_basedir() == str(tmp_path / "data")
+    monkeypatch.setattr(mm, "BASEDIR", None)
+    dm.set_basedir(str(tmp_path / "data"))
+    assert dm.get_basedir() == str(tmp_path / "data") == mm.BASEDIR   # stations use the same
+
+
+def test_does_not_import_an_installed_sweep():
+    import sys
+
+    import dmz_measure  # noqa: F401
+    assert "sweep" not in sys.modules or not sys.modules["sweep"].__file__.startswith(
+        str(__import__("pathlib").Path(dmz_measure.__file__).parent))
+    assert dm.Station.__mro__[2].__module__ == "dmz_measure.measureme.sweep"
 
 
 def test_runwriter_ids_and_sweep_compat(tmp_path):

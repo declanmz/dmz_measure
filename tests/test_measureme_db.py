@@ -5,7 +5,7 @@ import os.path
 import tempfile
 import unittest
 
-import sweep.db as db
+from dmz_measure.measureme import db
 
 
 def _count_lines(path: str):

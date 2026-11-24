@@ -1,42 +1,46 @@
 # dmz_measure
 
-A fork of [measureme](https://github.com/sharpelab/measureme) (upstream: `sharpelab/measureme`)
-with SR860 streaming on top:
+measureme's measurement framework and SR860 streaming in one package, behind one import
+(`import dmz_measure as dm`):
+* **measureme, included.** `dm.Station`, `dm.AsyncStation`, `dm.set_basedir`,
+  `dm.list_measurements` and `dm.pload` are measureme's, copied into
+  `dmz_measure.measureme`.
 * **Streamed sweeps.** `s.stream_sweep` and `s.stream_megasweep` work like `s.sweep` and
   `s.megasweep`. Each point is averaged from the lock-in data stream, with nothing leaking
   between points, and can be re-averaged later.
 * **Excitation frequency.** A noise survey, frequency ranking and frequency check for
   choosing it.
 
-measureme's `sweep` package is included **unchanged**, so existing notebooks
-(`import sweep`, `sweep.Station`, `s.sweep`, `sweep_load.pload`) keep working, and upstream
-updates merge cleanly. measureme's own README is in `README_measureme.md`. GPL-3.0, like
-measureme.
+The measureme code was copied from [sharpelab/measureme](https://github.com/sharpelab/measureme)
+(commit `2fab7a4`; authors spxtr and Aaron Sharpe; GPL-3.0, so dmz_measure is GPL-3.0 too).
+This repo does not follow measureme any more: later changes there don't come in
+automatically. Two changes were made to the copy: its imports are internal to the
+package, and its plot module only switches to the Qt backend inside the live-plot window,
+so `%matplotlib inline` can go anywhere. measureme's own README is kept as
+`README_measureme.md`.
 
-**Status (v0.5).** Tested offline against fake SR860s and a fake gated device that stream
-real UDP packets, through measureme's own `Station`. It has **not been run on the CryoFree
-yet.**
+**dmz_measure never imports an installed measureme (`sweep`)**, so both can be on the
+same computer and your existing notebooks keep using `import sweep` as before.
+
+**Status (v0.6).** Tested offline against fake SR860s and a fake gated device that stream
+real UDP packets. It has **not been run on the CryoFree yet.**
 
 ## Install
 
-This installs both `sweep` (measureme) and `dmz_measure`:
-
 ```
-pip uninstall sweep                      # a separately installed measureme, if any
 git clone https://github.com/declanmz/dmz_measure.git
 pip install -e dmz_measure
 ```
 
-As with measureme, live plots need PyQt5. To pull measureme updates into the fork:
-`git fetch upstream && git merge upstream/main`.
+As with measureme, live plots (`s.plot`) need PyQt5.
 
-## Measuring: exactly measureme, plus streaming
+## Measuring: measureme, plus streaming
 
 ```python
-import sweep, dmz_measure as dm
-sweep.set_basedir('./data_03+12')
+import dmz_measure as dm
+dm.set_basedir('./data_03+12')
 
-s = dm.AsyncStation(measurement_config)          # = sweep.AsyncStation (dm.Station = sweep.Station)
+s = dm.AsyncStation(measurement_config)          # measureme's AsyncStation + streaming
 s.add_comment('back-gate line')
 for SR860, gain in SR860s:
     s.fp(SR860.X, gain=gain)
@@ -175,14 +179,17 @@ To remove the rule: `Remove-NetFirewallRule -DisplayName "SR860 streaming"`.
 
 ## Tests
 
-`pytest` (~80 s; needs PyQt5 because `import sweep` selects the Qt backend). It covers:
+`pytest` (~80 s). It covers:
 * the packet format;
 * the spectrum calibration and the noise prediction for every filter type, checked
   against a software lock-in;
 * catching bursty noise;
-* stations against fake instruments: measureme's own `sweep` unchanged, `stream_sweep`
-  with the same columns and readable by `pload1d`, `stream_megasweep`, `refilter`, and
-  the survey and check from a station;
+* measureme's own tests, run on the included copy (the live-plot test only with
+  `DMZ_TEST_PLOTS=1`, since it opens a Qt window);
+* that dmz_measure never imports an installed `sweep`;
+* stations against fake instruments: measureme's `s.sweep` unchanged, `stream_sweep`
+  with the same columns and readable by `dm.pload1d`, `stream_megasweep`, `refilter`,
+  and the survey and check from a station;
 * the timing tools against a fake gate that ramps like qcodes, with a set latency and a
   slow gate line.
 

@@ -237,7 +237,7 @@ def refilter(run_id: int, dwell: Optional[float] = None, settle: Optional[float]
              window: Optional[str] = None, basedir: Optional[str] = None) -> Dict[str, Any]:
     """Redo the per-point averaging of a streamed run with other settle / dwell / window.
 
-    Returns the data like sweep.sweep_load.pload: {'xs': ..., ('ys': ...), column: array},
+    Returns the data like dm.pload: {'xs': ..., ('ys': ...), column: array},
     2D runs reshaped to (slow, fast). Nothing is re-measured and the saved run is unchanged.
     """
     run = load_run(run_id, basedir)

@@ -2,12 +2,12 @@
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
-# A fork of measureme (upstream: https://github.com/sharpelab/measureme, GPL-3.0).
-# Installs measureme's unchanged `sweep` package plus `dmz_measure` on top of it.
-# Uninstall a separately installed measureme first: pip uninstall sweep
+# dmz_measure includes a copy of measureme (https://github.com/sharpelab/measureme, commit
+# 2fab7a4, GPL-3.0) as dmz_measure.measureme. It does not use or replace an installed
+# measureme (`sweep`): both can be installed side by side.
 [project]
 name = "dmz_measure"
-version = "0.5.0"
+version = "0.6.0"
 description = "measureme + SR860 streaming, noise surveys and streamed gate sweeps"
 readme = "README.md"
 license = {text = "GPL-3.0-or-later"}
@@ -18,7 +18,7 @@ dependencies = ["numpy>=1.21", "scipy>=1.7", "matplotlib>=3.5", "tqdm", "ipython
 test = ["pytest"]
 
 [tool.setuptools.packages.find]
-include = ["dmz_measure*", "sweep*"]
+include = ["dmz_measure*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,9 +1,10 @@
 """measureme's Station, plus streaming.
 
-``dm.Station`` / ``dm.AsyncStation`` are measureme's ``sweep.Station`` /
-``sweep.AsyncStation`` (this repo is a fork of measureme, and ``sweep`` is unchanged), so
-everything works exactly as before: ``fp``, ``plot``, ``add_comment``, ``sweep``,
-``megasweep``, ``watch``, ``ramp``, ``read``, the live plots and the data files.
+``dm.Station`` / ``dm.AsyncStation`` build on measureme's Station / AsyncStation, which are
+included in this package (``dmz_measure.measureme``, copied from measureme; nothing imports
+an installed ``sweep``). Everything works exactly as in measureme: ``fp``, ``plot``,
+``add_comment``, ``sweep``, ``megasweep``, ``watch``, ``ramp``, ``read``, the live plots and
+the data files.
 
 Added:
 
@@ -25,9 +26,9 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-import sweep as _measureme
-import sweep.db
-from sweep.sweep import SweepResult, _interruptible, _sec_to_str
+from .measureme import db as _db
+from .measureme import sweep as _mm
+from .measureme.sweep import SweepResult, _interruptible, _sec_to_str
 from tqdm.auto import tqdm
 
 from . import check as _check
@@ -107,7 +108,7 @@ class _Streaming:
                 wait = b + settle - time.time()
                 if wait > 0:
                     time.sleep(wait)
-                self._run_run_befores()
+                self._run_run_befores(station=self, writer=w)
                 futures = self._start_reads(pool, plan)     # other parameters, during the dwell
                 wait = b + settle + dwell - time.time()
                 if wait > 0:
@@ -125,7 +126,7 @@ class _Streaming:
                 if self.interrupt_requested:
                     interrupted = True
                     break
-                self._run_run_afters()
+                self._run_run_afters(station=self, data=data, writer=w)
         finally:
             pool.shutdown(wait=True)
             raw = live.stop()
@@ -150,7 +151,7 @@ class _Streaming:
         """
         self._check_interrupted()
         ios, plan = self._stream_plan()
-        with sweep.db.Writer(self._basedir) as w, self._plotter as p:
+        with _db.Writer(self._basedir) as w, self._plotter as p:
             self.logger.info(f"Starting stream_sweep with ID {w.id}")
             w.metadata["comments"] = self._comments
             w.metadata["type"] = "1D"
@@ -196,7 +197,7 @@ class _Streaming:
         self._check_interrupted()
         ios, plan = self._stream_plan()
         segments = []
-        with sweep.db.Writer(self._basedir) as w, self._plotter as p:
+        with _db.Writer(self._basedir) as w, self._plotter as p:
             self.logger.info(f"Starting stream_megasweep with ID {w.id}")
             w.metadata["comments"] = self._comments
             w.metadata["type"] = "2D"
@@ -303,9 +304,9 @@ class _Streaming:
                                         comment="; ".join(self._comments), **kw)
 
 
-class Station(_Streaming, _measureme.Station):
+class Station(_Streaming, _mm.Station):
     """measureme's Station + stream_sweep, stream_megasweep, noise_survey, check_frequencies."""
 
 
-class AsyncStation(_Streaming, _measureme.AsyncStation):
+class AsyncStation(_Streaming, _mm.AsyncStation):
     """measureme's AsyncStation (parallel reads per instrument) + the streaming methods."""

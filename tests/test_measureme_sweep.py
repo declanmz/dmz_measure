@@ -1,8 +1,11 @@
 import tempfile
 import unittest
 
-import sweep
-import sweep.db as db
+import os
+
+import pytest
+
+from dmz_measure.measureme import db, sweep
 
 
 class _DummyParam:
@@ -17,7 +20,7 @@ class _DummyParam:
 
 class TestStation(unittest.TestCase):
     def setUp(self):
-        self.dir = tempfile.TemporaryDirectory()
+        self.dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)  # Windows: log.log stays open
 
     def tearDown(self):
         self.dir.cleanup()
@@ -46,6 +49,7 @@ class TestStation(unittest.TestCase):
             self.assertEqual(r.metadata['columns'][3], 'p3')
             self.assertEqual(len(r.all_data()), 1000)
 
+    @pytest.mark.skipif(not os.environ.get("DMZ_TEST_PLOTS"), reason="opens a Qt plot window")
     def test_sweep_plot(self):
         s = sweep.Station(basedir=self.dir.name, verbose=True)
         s.fp(_DummyParam('p2', 1.0)).fp(_DummyParam('p3', 2.0))

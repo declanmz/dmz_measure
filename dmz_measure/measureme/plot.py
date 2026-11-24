@@ -1,3 +1,6 @@
+# Part of dmz_measure. Copied from measureme (https://github.com/sharpelab/measureme,
+# commit 2fab7a4, authors spxtr and Aaron Sharpe), GPL-3.0; see LICENSE.
+# Modified: the Qt backend is selected inside the plot process only.
 import enum
 import io
 import math
@@ -8,7 +11,6 @@ import numpy as np
 import scipy
 from scipy.interpolate import griddata
 import matplotlib
-matplotlib.use('Qt5Agg')
 import matplotlib.pyplot as plt
 
 
@@ -103,6 +105,9 @@ class _PlotProc:
 
 
 def _plot_loop(conn):
+    # Only the live-plot process uses Qt; importing this module no longer changes
+    # the matplotlib backend of the notebook.
+    matplotlib.use('Qt5Agg')
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     p = _PlotProc()
     quit = False

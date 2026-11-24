@@ -1,3 +1,6 @@
+# Part of dmz_measure. Copied from measureme (https://github.com/sharpelab/measureme,
+# commit 2fab7a4, authors spxtr and Aaron Sharpe), GPL-3.0; see LICENSE.
+# Modified: imports are relative to this package.
 import dataclasses
 import functools
 import os
@@ -14,8 +17,8 @@ import logging
 
 from IPython import display
 
-import sweep.db
-import sweep.plot
+from . import db
+from . import plot
 
 import numpy as np
 
@@ -66,7 +69,7 @@ def list_measurements(basedir=None):
     i = 0
     while True:
         try:
-            with sweep.db.Reader(path, i) as r:
+            with db.Reader(path, i) as r:
                 data.append(line(i, r.metadata))
             i += 1
         except:
@@ -91,7 +94,7 @@ def measurement_info(i, basedir=None):
             newls = l
         return '[' + ', '.join([str(x) for x in newls]) + ']'
 
-    with sweep.db.Reader(path, i) as r:
+    with db.Reader(path, i) as r:
         print('ID:', i)
         print('Data path:', r.datapath)
         md = r.metadata
@@ -171,7 +174,7 @@ class Station:
         self._init_logger()
         self._params: List = []
         self._measurement_config: dict = measurement_config
-        self._plotter = sweep.plot.Plotter()
+        self._plotter = plot.Plotter()
         self._run_befores = []
         self._run_afters = []
         self._comments = []
@@ -223,7 +226,7 @@ class Station:
 
         station : Station
             The active Station instance.
-        writer : sweep.db.Writer
+        writer : db.Writer
             The current data writer (available inside measurement loops).
         data : list
             The most recent measured data point (run-after only).
@@ -338,7 +341,7 @@ class Station:
 
     def measure(self):
         self._check_interrupted()
-        with sweep.db.Writer(self._basedir) as w:
+        with db.Writer(self._basedir) as w:
             self.logger.info(f'Starting measure with ID {w.id}')
             w.metadata['comments'] = self._comments
             w.metadata['type'] = '0D'
@@ -370,7 +373,7 @@ class Station:
     @_interruptible
     def watch(self, delay: float=0.0, max_duration=None):
         self._check_interrupted()
-        with sweep.db.Writer(self._basedir) as w, self._plotter as p:
+        with db.Writer(self._basedir) as w, self._plotter as p:
             self.logger.info(f'Starting watch with ID {w.id}')
             w.metadata['comments'] = self._comments
             w.metadata['type'] = '1D'
@@ -424,7 +427,7 @@ class Station:
     @_interruptible
     def sweep(self, param, setpoints, delay: float=0.0):
         self._check_interrupted()
-        with sweep.db.Writer(self._basedir) as w, self._plotter as p:
+        with db.Writer(self._basedir) as w, self._plotter as p:
             self.logger.info(f'Starting sweep with ID {w.id}')
             self.logger.debug(f'Sweeping: {param.full_name}')
             self.logger.info(f'Minimum duration {_sec_to_str(len(setpoints) * delay)}')
@@ -487,7 +490,7 @@ class Station:
             raise ValueError('not all setpoint lists have same length!')
 
         setpoints = [list(i) for i in zip(*setpointslist)]
-        with sweep.db.Writer(self._basedir) as w, self._plotter as p:
+        with db.Writer(self._basedir) as w, self._plotter as p:
             self.logger.info(f'Starting multisweep with ID {w.id}')
             paramlist = []
             for param in params:
@@ -551,7 +554,7 @@ class Station:
     def megasweep(self, slow_param, slow_v, fast_param, fast_v, 
                   slow_delay: float=0.0, fast_delay: float=0.0, init_delay=True):
         self._check_interrupted()
-        with sweep.db.Writer(self._basedir) as w, self._plotter as p:
+        with db.Writer(self._basedir) as w, self._plotter as p:
             self.logger.info(f'Starting megasweep with ID {w.id}')
             self.logger.debug(f'Slow: {slow_param.full_name}, Fast: {fast_param.full_name}')
             min_duration = len(slow_v) * len(fast_v) * fast_delay + len(slow_v) * slow_delay
@@ -643,7 +646,7 @@ class Station:
         slow_vs = [list(i) for i in zip(*slow_v_list)]
         fast_vs = [list(i) for i in zip(*fast_v_list)]
 
-        with sweep.db.Writer(self._basedir) as w, self._plotter as p:
+        with db.Writer(self._basedir) as w, self._plotter as p:
             self.logger.info(f'Starting multimegasweep with ID {w.id}')
             slowparamlist = []
             for param in slow_params:

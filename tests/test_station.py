@@ -2,9 +2,8 @@
 import numpy as np
 import pytest
 
-import sweep
-import sweep.sweep_load
 import dmz_measure as dm
+from dmz_measure.measureme import sweep as mm
 from dmz_measure.simulate import FakeGate, fake_cryofree
 
 CONFIG = {"SR860_A": "9-12", "SR860_B": "15-14", "SR860_C": "15-11", "Vbg2": "13", "Vtg2": "16"}
@@ -42,20 +41,20 @@ def R_from(d, name):
 
 
 def test_stations_are_measureme_stations():
-    assert issubclass(dm.Station, sweep.Station)
-    assert issubclass(dm.AsyncStation, sweep.AsyncStation)
+    assert issubclass(dm.Station, mm.Station)
+    assert issubclass(dm.AsyncStation, mm.AsyncStation)
     for m in ("fp", "plot", "sweep", "megasweep", "watch", "ramp", "read", "add_comment"):
-        assert getattr(dm.Station, m) is getattr(sweep.Station, m)
+        assert getattr(dm.Station, m) is getattr(mm.Station, m)
 
 
 def test_normal_sweep_is_measureme(rig, tmp_path):
     for n, _ in GAINS:
-        rig[n].write("OFLT 8")  # 10 ms, so a short delay settles
+        rig[n].write("OFLT 9")  # 30 ms: settled after a 0.3 s delay, quiet enough for 5%
     s = make_station(rig, tmp_path, dm.AsyncStation)
     V = np.linspace(-0.2, 0.6, 6)
-    r = s.sweep(rig["Kbg2"].volt, V, delay=0.2)
+    r = s.sweep(rig["Kbg2"].volt, V, delay=0.3)
     assert r.metadata["function"] == "sweep"
-    d = sweep.sweep_load.pload1d(str(tmp_path), r.id)
+    d = dm.pload1d(str(tmp_path), r.id)
     np.testing.assert_allclose(R_from(d, "SR860_B"), model_R("SR860_B", V), rtol=0.05)
 
 
@@ -71,7 +70,7 @@ def test_stream_sweep_same_columns_restores_and_refilters(rig, tmp_path):
         f"{n}_{c}" for n, _ in GAINS for c in "XY"] + ["Kbg2_sense_current"]
     assert md["stream"]["tau"] == pytest.approx(1e-3) and md["stream"]["sync"]
     assert (a.freq, a.slvl, a.oflt, a.sync, rig["SR860_B"].oflt) == before  # restored, excitation untouched
-    d = sweep.sweep_load.pload1d(str(tmp_path), r.id)                      # measureme reads it
+    d = dm.pload1d(str(tmp_path), r.id)                      # measureme reads it
     np.testing.assert_allclose(R_from(d, "SR860_B"), model_R("SR860_B", V), rtol=0.03)
     assert np.all(np.abs(d["Kbg2_sense_current"]) < 1e-10)                # read normally
     re = dm.refilter(r.id, dwell=0.05, window="boxcar", basedir=str(tmp_path))
@@ -87,7 +86,7 @@ def test_stream_megasweep(rig, tmp_path):
     fast = np.linspace(-0.2, 0.6, 5)
     r = s.stream_megasweep(top.volt, [0.0, 0.5], rig["Kbg2"].volt, fast, slow_delay=0.2, dwell=0.1)
     assert r.metadata["function"] == "stream_megasweep" and r.metadata["type"] == "2D"
-    d = sweep.sweep_load.pload2d(str(tmp_path), r.id)
+    d = dm.pload2d(str(tmp_path), r.id)
     assert d["SR860_B_X"].shape == (2, 5)
     for row in range(2):
         np.testing.assert_allclose(R_from(d, "SR860_B")[row], model_R("SR860_B", fast), rtol=0.04)
@@ -157,7 +156,7 @@ def test_stream_sweep_reads_during_the_dwell(rig, tmp_path):
     t_set = dm.load_run(r.id, str(tmp_path)).arrays("stream")["0_t_set0"]
     per_point = np.median(np.diff(t_set))
     assert per_point < 0.02 + 0.1 + 0.2 + 0.06             # the 0.15 s reads are hidden in the dwell
-    d = sweep.sweep_load.pload1d(str(tmp_path), r.id)
+    d = dm.pload1d(str(tmp_path), r.id)
     assert np.all(np.isfinite(d["Kbg2_sense_current"]))
 
 

@@ -1,11 +1,11 @@
-"""Run storage, compatible with measureme's (``sweep``) folder layout.
+"""Run storage in measureme's folder layout.
 
 Each run gets the lowest free integer folder in ``basedir`` (the same scheme as
-``sweep.db.Writer``), so dmz_measure and sweep can share one data folder and the
-ID numbers stay in one sequence. Every run folder contains
+measureme's ``db.Writer``, included in dmz_measure.measureme), so all runs share one ID
+sequence in the data folder. Every run folder contains
 
 * ``metadata.json``  with at least ``type``, ``interrupted``, ``start_time``,
-  ``end_time``, ``columns``, ``comments`` (so ``sweep.list_measurements`` lists it)
+  ``end_time``, ``columns``, ``comments`` (so ``dm.list_measurements`` lists it)
 * ``data.tsv.gz``    a small numeric table (np.loadtxt-able), e.g. the spectra
 * optional ``*.npz`` arrays (time series) and ``*.png`` figures
 """
@@ -14,28 +14,28 @@ from __future__ import annotations
 import gzip
 import json
 import os
-import sys
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
 
-_BASEDIR: Optional[str] = None
-
 
 def set_basedir(path: str) -> None:
-    """Default data folder for runs (otherwise sweep's folder from sweep.set_basedir is used)."""
-    global _BASEDIR
-    _BASEDIR = path
+    """Data folder for all runs (stations and the survey/check tools): dm.set_basedir."""
+    from .measureme import sweep as _mm
+
+    _mm.set_basedir(path)
 
 
 def get_basedir(basedir: Optional[str] = None, required: bool = True) -> Optional[str]:
-    """basedir argument > dmz_measure.set_basedir > sweep.set_basedir."""
-    path = basedir or _BASEDIR or getattr(sys.modules.get("sweep.sweep"), "BASEDIR", None)
+    """basedir argument, else the folder set with dm.set_basedir."""
+    from .measureme import sweep as _mm
+
+    path = basedir or _mm.BASEDIR
     if path is None:
         if required:
-            raise ValueError("no data folder: call sweep.set_basedir(...) or pass basedir=...")
+            raise ValueError("no data folder: call dm.set_basedir(...) or pass basedir=...")
         return None
     return os.path.expanduser(path)
 

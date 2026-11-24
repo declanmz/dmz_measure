@@ -163,7 +163,7 @@ def noise_survey(measurement_config: Mapping[str, Any], gains: Optional[Mapping[
     tau        : lock-in time constant during the survey (keep it <= 100 us so the band is flat)
     rate       : stream sample rate (Hz); ~100x the band is plenty against aliasing
     gains      : preamp gains to divide out; current: the lock-in that measures current
-    basedir    : data folder (default: the one from sweep.set_basedir)
+    basedir    : data folder (default: the one from dm.set_basedir)
     """
     fmax = 2 * f_ref if fmax is None else fmax
     lockins = lockins_from_config(measurement_config, gains, current)
@@ -204,7 +204,7 @@ def noise_survey(measurement_config: Mapping[str, Any], gains: Optional[Mapping[
         _save_survey(survey, base, comment or f"noise survey f_ref {f_ref:g} Hz",
                      measurement_config)
     else:
-        print("Not saved: no data folder (call sweep.set_basedir(...) or pass basedir=...)")
+        print("Not saved: no data folder (call dm.set_basedir(...) or pass basedir=...)")
     print(survey)
     return survey
 
