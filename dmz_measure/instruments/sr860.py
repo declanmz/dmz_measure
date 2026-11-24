@@ -1,8 +1,8 @@
 """Minimal SR860 command I/O: a thin wrapper, settings snapshots and restore.
 
 dmz_measure sends raw SR860 commands through the qcodes SR860 objects you
-already have open (``.write`` / ``.ask``); pyvisa resources (``.query``) and
-:class:`dmz_measure.simulate.FakeSR860` work too.
+already have open (``.write`` / ``.ask``); pyvisa resources (``.query``) and simulated
+lock-ins (registered with :func:`register_instrument`) work too.
 
 Streaming needs the VXI-11 address form (``TCPIP::<ip>::inst0::INSTR``): the
 SR860 sends UDP packets to the IP that sent ``STREAM ON`` over VXI-11.
@@ -97,12 +97,18 @@ def as_io(inst: Any, name: Optional[str] = None) -> LockinIO:
     return inst if isinstance(inst, LockinIO) and name is None else LockinIO(inst, name)
 
 
-def find_instrument(name: str) -> Optional[Any]:
-    """The open instrument called `name` (qcodes, or a FakeSR860), or None."""
-    from ..simulate import FakeSR860
+_registry: Dict[str, Any] = {}
 
-    if name in FakeSR860.registry:
-        return FakeSR860.registry[name]
+
+def register_instrument(name: str, inst: Any) -> None:
+    """Make `inst` findable by name like an open qcodes instrument (for simulated instruments)."""
+    _registry[name] = inst
+
+
+def find_instrument(name: str) -> Optional[Any]:
+    """The open instrument called `name` (qcodes, or one given to register_instrument), or None."""
+    if name in _registry:
+        return _registry[name]
     try:
         from qcodes.instrument import Instrument
     except ImportError:
